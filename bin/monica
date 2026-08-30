@@ -1,0 +1,76 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Monica\Client;
+use Monica\Transport\CurlTransport;
+use Monica\Transport\SpoolFlusher;
+
+$autoload = isset($GLOBALS['_composer_autoload_path'])
+    ? $GLOBALS['_composer_autoload_path']
+    : dirname(__DIR__) . '/vendor/autoload.php';
+if (!is_file($autoload)) {
+    fwrite(STDERR, "Composer autoload file was not found. Run composer install first.\n");
+    exit(2);
+}
+require $autoload;
+
+$command = isset($argv[1]) ? $argv[1] : 'help';
+$options = getopt('', ['dsn::', 'environment::', 'release::', 'spool-dir::', 'timeout-ms::']);
+$dsn = isset($options['dsn']) ? (string) $options['dsn'] : (string) getenv('MONICA_DSN');
+$environment = isset($options['environment'])
+    ? (string) $options['environment']
+    : ((string) getenv('MONICA_ENVIRONMENT') ?: 'production');
+$release = isset($options['release']) ? (string) $options['release'] : (string) getenv('MONICA_RELEASE');
+$timeout = isset($options['timeout-ms']) ? max(1, (int) $options['timeout-ms']) : 2000;
+$spoolDirectory = isset($options['spool-dir'])
+    ? (string) $options['spool-dir']
+    : ((string) getenv('MONICA_SPOOL_DIR') ?: sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'monica-spool');
+
+if ($command === 'test') {
+    if ($dsn === '') {
+        fwrite(STDERR, "MONICA_DSN or --dsn is required.\n");
+        exit(2);
+    }
+    $client = new Client([
+        'dsn' => $dsn,
+        'environment' => $environment,
+        'release' => $release !== '' ? $release : null,
+        'auto_capture' => false,
+        'request_timeout_ms' => $timeout,
+    ]);
+    $client->captureMessage('MONICA PHP SDK connectivity test', 'info', [
+        'tags' => ['source' => 'monica-cli'],
+    ]);
+    if (!$client->flush($timeout)) {
+        fwrite(STDERR, "MONICA connectivity test failed.\n");
+        exit(1);
+    }
+    fwrite(STDOUT, "MONICA connectivity test accepted.\n");
+    exit(0);
+}
+
+if ($command === 'spool:flush') {
+    if ($dsn === '') {
+        fwrite(STDERR, "MONICA_DSN or --dsn is required.\n");
+        exit(2);
+    }
+    $flusher = new SpoolFlusher($spoolDirectory, new CurlTransport($dsn));
+    $result = $flusher->flush($timeout);
+    fwrite(
+        STDOUT,
+        sprintf(
+            "MONICA spool: sent=%d failed=%d invalid=%d\n",
+            $result['sent'],
+            $result['failed'],
+            $result['invalid']
+        )
+    );
+    exit($result['failed'] > 0 || $result['invalid'] > 0 ? 1 : 0);
+}
+
+fwrite(STDOUT, "Usage:\n");
+fwrite(STDOUT, "  monica test [--dsn=...] [--environment=...] [--release=...] [--timeout-ms=2000]\n");
+fwrite(STDOUT, "  monica spool:flush [--dsn=...] [--spool-dir=...] [--timeout-ms=2000]\n");
+exit($command === 'help' ? 0 : 2);

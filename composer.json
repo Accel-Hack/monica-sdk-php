@@ -1,0 +1,35 @@
+{
+  "name": "monica/monica",
+  "description": "Framework-independent PHP error monitoring SDK for MONICA",
+  "license": "Apache-2.0",
+  "type": "library",
+  "require": {
+    "php": ">=7.4",
+    "ext-json": "*",
+    "ext-zlib": "*",
+    "psr/http-client": "^1.0",
+    "psr/http-factory": "^1.0",
+    "psr/http-message": "^1.0 || ^2.0"
+  },
+  "suggest": {
+    "ext-curl": "Required by the default HTTP transport when no PSR-18 client is supplied"
+  },
+  "require-dev": {
+    "nyholm/psr7": "^1.8"
+  },
+  "autoload": {
+    "psr-4": {
+      "Monica\\": "src/"
+    }
+  },
+  "bin": [
+    "bin/monica"
+  ],
+  "scripts": {
+    "test": "php tests/run.php && php tests/fatal-runner.php"
+  },
+  "support": {
+    "issues": "https://github.com/Accel-Hack/monica/issues",
+    "source": "https://github.com/Accel-Hack/monica"
+  }
+}
