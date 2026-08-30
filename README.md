@@ -1,6 +1,10 @@
-# monica/monica
+# ah-monica/monica
 
 Frameworkに依存せず、PHP 7.4以上からMONICAへ例外を送るcore SDKです。
+
+```sh
+composer require ah-monica/monica
+```
 
 ## 初期化
 
