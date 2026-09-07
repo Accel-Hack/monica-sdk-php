@@ -1,0 +1,4 @@
+# specは Accel-Hack/monica の所有物で、この package の配布物には含めない。
+# gitlink は元々 archive に中身が入らないが、空ディレクトリすら残さないことで
+# 「配布物に spec は無い」を意図として固定する。
+/.spec-src export-ignore
