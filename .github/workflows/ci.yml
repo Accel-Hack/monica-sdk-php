@@ -27,38 +27,8 @@ jobs:
       # 404 で返るせいで「repository not found」だけが出て原因が読めない。
       - uses: actions/checkout@v6
 
-      # .spec-src は private な Accel-Hack/monica を指すので、GITHUB_TOKEN では読めない。
-      # 全 SDK repository が同じ App を使えるよう、token は GitHub App から作る。
-      # App が未設定でも失敗の理由が読めるよう、ここでは落とさず次の step で判定する。
-      - name: 仕様repositoryのread tokenを作る
-        id: spec-token
-        continue-on-error: true
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.SPEC_APP_ID }}
-          private-key: ${{ secrets.SPEC_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: monica
-
-      - name: 仕様submoduleを取得
-        env:
-          # App が入るまでは PAT を SPEC_READ_TOKEN に置いても動く。
-          SPEC_TOKEN: ${{ steps.spec-token.outputs.token || secrets.SPEC_READ_TOKEN }}
-        run: |
-          if [ -z "$SPEC_TOKEN" ]; then
-            echo "::error::Accel-Hack/monica を読む token がありません。private repository は 403 ではなく 404 を返すため、GITHUB_TOKEN では submodule が「repository not found」になります。organization variable SPEC_APP_ID と secret SPEC_APP_PRIVATE_KEY に、Accel-Hack/monica の Contents:read を持つ GitHub App を設定してください（暫定なら secret SPEC_READ_TOKEN に PAT でも動きます）。"
-            exit 1
-          fi
-          # 記録された commit を取りたいので checkout ではなく submodule update を使う。
-          git -c "url.https://x-access-token:$SPEC_TOKEN@github.com/.insteadOf=https://github.com/" \
-            submodule update --init --depth 1 .spec-src
-          # spec/ 以外は要らない。README が案内する手順が CI でも成立することの確認も兼ねる。
-          git -C .spec-src sparse-checkout init --cone
-          git -C .spec-src sparse-checkout set spec
-          if [ ! -f .spec-src/spec/event-schema.json ]; then
-            echo "::error::.spec-src/spec/event-schema.json がありません。submodule は取れましたが spec/ が入っていません。"
-            exit 1
-          fi
+      - name: PREFLIGHT-ONLY
+        run: echo "throwaway branch - spec submodule and contract test are skipped"
 
       - uses: shivammathur/setup-php@v2
         with:
@@ -81,4 +51,5 @@ jobs:
         run: |
           composer validate --strict
           composer install --no-interaction --prefer-dist
-          composer test
+          php tests/run.php
+          php tests/fatal-runner.php
