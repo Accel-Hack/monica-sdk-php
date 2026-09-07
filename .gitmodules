@@ -1,0 +1,3 @@
+[submodule ".spec-src"]
+	path = .spec-src
+	url = https://github.com/Accel-Hack/monica.git

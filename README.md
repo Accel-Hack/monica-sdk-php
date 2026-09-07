@@ -59,3 +59,39 @@ PSR-18 clientを使う場合は、`http_client`、`request_factory`、
 `null`を返します。個人情報を扱うサービスではblacklistではなく、MONICAへ送ってよい
 キーだけでeventを組み直すallowlist方式を推奨します。transportとhook内の例外は
 アプリケーションへ投げ返さず、MONICA自身の失敗を再収集しません。
+
+## 開発
+
+この repository が PHP SDK の正本です。`Accel-Hack/monica` の `sdk/php/core` は
+生成物ではなくなり、変更はここへ入れます。
+
+protocol の仕様は言語に依存しない契約なので、この repository は持ちません。
+`Accel-Hack/monica` の `spec/` を submodule として参照します。
+
+```sh
+git clone --recurse-submodules git@github.com:Accel-Hack/monica-sdk-php.git
+# 既に clone している場合
+git submodule update --init --depth 1
+# spec/ 以外は要らないので絞る（任意）
+git -C .spec-src sparse-checkout init --cone
+git -C .spec-src sparse-checkout set spec
+```
+
+`Accel-Hack/monica` は private なので、submodule の取得には同 repository への
+read 権限が必要です。CI では repository secret `SPEC_READ_TOKEN` を使います。
+
+```sh
+composer install
+composer test
+```
+
+`composer test` は 3 つを順に走らせます。
+
+- `tests/run.php`: SDK 内部の振る舞い（DSN 検証、before_send、spool、PSR-18 経路）
+- `tests/fatal-runner.php`: 子プロセスの fatal shutdown で spool に 1 件残ること
+- `tests/spec-contract.php`: 送信する envelope が `spec/event-schema.json` を満たすこと
+
+契約テストは spec が見つからないと skip せず失敗します。契約が変わったときに
+PHP だけ気付けない状態を作らないためです。
+
+release は tag を打つだけです。Packagist が push webhook で version を拾います。

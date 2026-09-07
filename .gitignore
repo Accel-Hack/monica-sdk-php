@@ -1,0 +1,4 @@
+/vendor/
+
+# library なので lock file は追跡しない。利用側の解決を固定してしまう。
+/composer.lock

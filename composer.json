@@ -26,7 +26,7 @@
     "bin/monica"
   ],
   "scripts": {
-    "test": "php tests/run.php && php tests/fatal-runner.php"
+    "test": "php tests/run.php && php tests/fatal-runner.php && php tests/spec-contract.php"
   },
   "support": {
     "issues": "https://github.com/Accel-Hack/monica/issues",

@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # composer.json requires >=7.4, Liew runs 8.0, 8.3 is the current stable.
+        php: ["7.4", "8.0", "8.3"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # .spec-src is the protocol spec (Accel-Hack/monica). That repository is
+          # private, so GITHUB_TOKEN cannot read it: SPEC_READ_TOKEN must be a
+          # token with Contents:read on Accel-Hack/monica. Without it the
+          # submodule fetch fails and the contract test cannot run.
+          submodules: true
+          token: ${{ secrets.SPEC_READ_TOKEN || github.token }}
+
+      - name: 仕様submoduleが取れたことを確認
+        run: |
+          if [ ! -f .spec-src/spec/event-schema.json ]; then
+            echo "::error::.spec-src/spec/event-schema.json がありません。" \
+              "Accel-Hack/monica は private なので、Contents:read を持つ" \
+              "SPEC_READ_TOKEN を repository secret に設定してください。"
+            exit 1
+          fi
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, json, zlib
+          coverage: none
+
+      - name: execが使えることを確認
+        # tests/fatal-runner.php は子プロセスを exec して fatal shutdown を見るので、
+        # exec が無効な runtime では検証そのものが成立しない。
+        run: |
+          php -r 'exec("printf ok", $out, $code);
+            if ($code !== 0 || ($out[0] ?? "") !== "ok") {
+              fwrite(STDERR, "exec is unavailable; tests/fatal-runner.php cannot verify fatal shutdown\n");
+              exit(1);
+            }
+            echo "exec available\n";'
+
+      - name: Composer packageを検証
+        run: |
+          composer validate --strict
+          composer install --no-interaction --prefer-dist
+          composer test
