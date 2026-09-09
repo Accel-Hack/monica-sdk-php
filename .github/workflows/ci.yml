@@ -21,10 +21,9 @@ on:
     # `0.1.1` というタグでも配布は成立してしまう。ここで拾っておかないと、
     # 綴りを外したタグだけが検査を素通りする。
     tags: ["v*", "[0-9]*"]
-  schedule:
-    # 公開契約は MONICA 側の都合で動く。PR が来るまで気付かないと、
-    # 気付いたときには「無関係な PR が落ちる」形で出てくる。
-    - cron: "17 21 * * *"
+  # 定期実行はしない。公開契約が動いたことは PR と main への push で気付く。
+  # repository が動いていない間の drift を能動的に知りたいときは、この workflow を
+  # workflow_dispatch で回す。
   workflow_dispatch:
 
 concurrency:
@@ -72,6 +71,10 @@ jobs:
   spec:
     # 配信元を叩くので matrix から外してある。network の失敗で PHP 3 版の
     # job が道連れになると、落ちた理由が読めなくなる。
+    #
+    # この job だけが repository の外の状態を見る。他の job は commit の性質を
+    # 見るので、落ちたら commit を直せば緑になるが、ここは配信元が動いた
+    # ことでも落ちる。直し方は spec を取り込み直すこと。
     name: 公開契約
     runs-on: ubuntu-latest
     timeout-minutes: 5
