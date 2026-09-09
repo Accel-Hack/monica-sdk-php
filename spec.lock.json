@@ -1,0 +1,31 @@
+{
+    "origin": "https://spec.monica.accelhack.net",
+    "version": "v1",
+    "revision": "9d5f65ea1f3d0ce041390bd9d434861840e2b0df6c925f2494790af967cba817",
+    "files": {
+        "README.md": "8149a3bea5896af8b22f37d26afcece48ed2acf89d3130e426a4cabdee672d8a",
+        "envelope.json": "638bf72a02479971360868f46d1d0bf949d33b8d17ff7a24b131a2c92c04efe1",
+        "error.json": "3db6dd5d1e6c330bbedf2b8d801744d68b43ac0f77c220565affc5c3c760b519",
+        "ingest.md": "110c6f7cead38e851fb57d164a62932aa6bef44021e0dfcbb9210f8a2eb47302",
+        "limits.json": "d75f08e62a0304a70e1c8c82ce3738a37433f910dd86c69d65699734180fe58f",
+        "payload.md": "1361c513847db4db07305b397a4f74c34aa6b505b62cc4bcbd8b4717411585a4",
+        "transport.json": "ff113a9bde2d114744991deae56d39a8497785c6c40347cd1901d7c8fc601b2b",
+        "vectors/envelope/empty-items.json": "b739086bb96ace13ada191254a3879b22b4f94802bf557493ada290b34ece4f0",
+        "vectors/envelope/empty-sdk-name.json": "704722f545df4fc24c7b15c4898c1a9499109afbaeb8b503144b672789228d53",
+        "vectors/envelope/full-error.json": "e40ca7cec9bca3b7f1a0df926070e6d560c8c2c072ef385ceb551a54e6060adb",
+        "vectors/envelope/impossible-calendar-date.json": "ff84809bc143738eafb28c935f18e7820c9c4c00c9bb2a4859003c3c9a2c1b06",
+        "vectors/envelope/invalid-event-id.json": "46af4681294f093a6d74d6ea37deb02c64c2d41c5f558352f27953c97c0225e2",
+        "vectors/envelope/invalid-mechanism-type.json": "d4a6b675452e3737a0ca534a6fe9461f4fa546c550012a6483cb56d7be3bbcdd",
+        "vectors/envelope/minimal-error.json": "58bcfd917c40ab45b499ff7d3f740323dc897542739b127895b3e17dad772070",
+        "vectors/envelope/missing-required-item-fields.json": "907a894fe4f720b3ac265dbfecf185a91d4e3a886537644cad85f43499481b15",
+        "vectors/envelope/negative-discarded.json": "4ab516cd11206194f02322e041b0708cb7a8e98eb303835f79257155ba808129",
+        "vectors/envelope/non-object-item.json": "a0983546a7c8898747b968c4ff65477a23be3d374071328ce0639d1417cf91c3",
+        "vectors/envelope/non-string-item-type.json": "9444f4123d4b9ad733165caa5214cc111ddaa7b28aa9f913a54fb2b1ec01d6e4",
+        "vectors/envelope/oversized-environment.json": "d6dfbe3a3d40da14220136dcc0e812f5084367b83068d03da98456f8b078b8ad",
+        "vectors/envelope/space-separated-timestamp.json": "f6868a97e9165fa356b96c14deea682454d583642572cb5203fd52672fb6072b",
+        "vectors/envelope/timezone-offset.json": "40b322371a6562433b823dcf89c95962c38e80bf9402d08da7abdc97c07b743b",
+        "vectors/envelope/too-many-items.json": "4bf7b5583cb4d8c686f2ae2cc2bb867b48ece552769002161795013ec7f72ca5",
+        "vectors/envelope/unknown-item-type.json": "6331387da15ac1ac5492ff23722d486ff53f37272b8ca03e6ed5abd6c30cd1fe",
+        "vectors/envelope/unsafe-discarded-count.json": "4c088f79e64ba0ccff9a9707771d400b31725d56c5d9c66ee0bf883b01f4805a"
+    }
+}

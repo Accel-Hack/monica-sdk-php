@@ -62,24 +62,6 @@ PSR-18 clientを使う場合は、`http_client`、`request_factory`、
 
 ## 開発
 
-この repository が PHP SDK の正本です。`Accel-Hack/monica` の `sdk/php/core` は
-生成物ではなくなり、変更はここへ入れます。
-
-protocol の仕様は言語に依存しない契約なので、この repository は持ちません。
-`Accel-Hack/monica` の `spec/` を submodule として参照します。
-
-```sh
-git clone --recurse-submodules git@github.com:Accel-Hack/monica-sdk-php.git
-# 既に clone している場合
-git submodule update --init --depth 1
-# spec/ 以外は要らないので絞る（任意）
-git -C .spec-src sparse-checkout init --cone
-git -C .spec-src sparse-checkout set spec
-```
-
-`Accel-Hack/monica` は private なので、submodule の取得には同 repository への
-read 権限が必要です。CI では repository secret `SPEC_READ_TOKEN` を使います。
-
 ```sh
 composer install
 composer test
@@ -89,9 +71,70 @@ composer test
 
 - `tests/run.php`: SDK 内部の振る舞い（DSN 検証、before_send、spool、PSR-18 経路）
 - `tests/fatal-runner.php`: 子プロセスの fatal shutdown で spool に 1 件残ること
-- `tests/spec-contract.php`: 送信する envelope が `spec/event-schema.json` を満たすこと
+- `tests/spec-contract.php`: 送信する envelope が MONICA の公開契約を満たすこと
+
+## 公開契約
+
+protocol は言語に依存しない契約なので、この repository は持ちません。MONICA が
+<https://spec.monica.accelhack.net/v1/> に配信しているものを取り込んだコピーが
+`spec/` にあります。
+
+```text
+spec.lock.json   取り込んだ内容の記録（version、revision、全ファイルの sha256）
+spec/v1/         取り込んだコピー（配布物には入りません）
+```
+
+取り込みは script でやります。手で `spec/` を編集しても、次の取り込みで消えます。
+
+```sh
+composer spec:sync           # 配信元から取り込み直す
+composer spec:check          # 取り込んだコピーが spec.lock.json と一致するか（network 不要）
+composer spec:check-remote   # さらに配信元が動いていないか
+```
+
+起点は配信元の `index.json` です。他の全ファイルのパスと sha256、バンドル全体の
+`revision` がそこに並んでいるので、**何を取り込むかは配信元が決めます**。この
+repository は取り込む対象の一覧を持ちません。結果として
+
+- ファイルの列挙、取得したものの整合性検査、上流にファイルが増えたことの検知が
+  索引 1 本で済みます
+- `spec:check-remote` は `revision` を 1 個比べるだけで、動いていたときに何が
+  追加・変更・削除されたかを索引から出します
+
+`revision` はバンドル全体の指紋（各ファイルの `"<sha256>  <path>"` を path の
+byte 順に改行で繋いだ文字列の sha256）で、版番号ではないので新旧や大小は読めません。
+`spec:check` はこれを `spec.lock.json` の `files` から再計算するので、`spec/` を
+書き換えて lock の digest を揃えただけの改竄も落ちます。
 
 契約テストは spec が見つからないと skip せず失敗します。契約が変わったときに
-PHP だけ気付けない状態を作らないためです。
+PHP だけ気付けない状態を作らないためです。schema を通ることは受理されることと
+同じではない（`payload.md` が prose で定めている義務がある）ので、
+`tests/spec-contract.php` は次の 4 層を見ます。
 
-release は tag を打つだけです。Packagist が push webhook で version を拾います。
+1. `envelope.json` と `limits.json` が、この SDK の前提どおりであること
+2. MONICA の test vector が、bundle の言うとおりの判定になること
+3. この SDK が出す envelope が、schema と `payload.md` の義務を満たすこと
+4. この SDK が投げる request が、`transport.json` の値と一致すること
+
+4 は `ingest.md` の散文から定数を写すのではなく、`transport.json` を読んで
+突き合わせます。だから MONICA 側が endpoint やヘッダを変えると、ここが落ちます。
+
+### まだ実装していない契約
+
+`transport.json` のうち、この SDK が実装しているのは `endpoint` / `dsn` / `auth`
+だけです。`status`（status ごとの挙動）と `retry`（`Retry-After`、backoff）には
+まだ consumer がなく、transport は bool を返すだけでリトライしません。
+`error.json` の body も読んでいません。
+
+黙って取り残されないように、契約テストは `transport.json` の section 名と status
+の語彙を固定しています。MONICA 側が section や status を増やすと、
+「この SDK が考慮していない契約が増えた」として落ちます。
+
+あわせて、envelope の byte 上限（gzip 1 MiB / 展開後 8 MiB）での分割も未実装です。
+item 数 100 での分割はあります。
+
+## Release
+
+tag を打つだけです。Packagist が push webhook で version を拾います。配布物には
+`src/`、`bin/`、`composer.json`、`README.md`、`LICENSE` だけが入ります
+（`.gitattributes` の `export-ignore`。CI の「配布物」job が実際の tarball で確認します）。

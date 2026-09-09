@@ -9,7 +9,7 @@ use RuntimeException;
 
 /**
  * Dependency-free validator for the JSON Schema draft 2020-12 subset that
- * spec/event-schema.json actually uses.
+ * spec/v1/envelope.json actually uses.
  *
  * The SDK ships with no schema library and must run on PHP 7.4, so the
  * keywords below are implemented by hand. An unsupported keyword is a hard
@@ -20,8 +20,8 @@ final class JsonSchema
 {
     private const SUPPORTED = [
         '$schema', '$id', '$defs', '$ref', 'title',
-        'type', 'enum', 'const', 'not', 'oneOf',
-        'required', 'properties', 'additionalProperties',
+        'type', 'enum', 'const', 'not', 'anyOf',
+        'required', 'properties', 'additionalProperties', 'propertyNames',
         'items', 'minItems', 'maxItems',
         'minLength', 'maxLength', 'pattern', 'format',
         'minimum',
@@ -93,20 +93,20 @@ final class JsonSchema
         if (isset($schema->not) && $this->check($value, $schema->not, $path) === []) {
             $errors[] = $path . ': must not match the "not" schema';
         }
-        if (isset($schema->oneOf)) {
-            $matched = [];
+        if (isset($schema->anyOf)) {
+            $matched = false;
             $branchErrors = [];
-            foreach ($schema->oneOf as $index => $branch) {
+            foreach ($schema->anyOf as $index => $branch) {
                 $branchResult = $this->check($value, $branch, $path);
                 if ($branchResult === []) {
-                    $matched[] = $index;
-                } else {
-                    $branchErrors[] = '#' . $index . ' ' . implode('; ', $branchResult);
+                    $matched = true;
+                    break;
                 }
+                $branchErrors[] = '#' . $index . ' ' . implode('; ', $branchResult);
             }
-            if (count($matched) !== 1) {
-                $errors[] = $path . ': matched ' . count($matched) . ' of ' . count($schema->oneOf)
-                    . ' oneOf branches (' . implode(' | ', $branchErrors) . ')';
+            if (!$matched) {
+                $errors[] = $path . ': matches none of the ' . count($schema->anyOf)
+                    . ' anyOf branches (' . implode(' | ', $branchErrors) . ')';
             }
         }
 
@@ -138,6 +138,12 @@ final class JsonSchema
             }
         }
         foreach (get_object_vars($value) as $key => $child) {
+            if (isset($schema->propertyNames)) {
+                // The subschema applies to the name, not to the value under it.
+                foreach ($this->check((string) $key, $schema->propertyNames, $path . '.' . $key) as $problem) {
+                    $errors[] = 'property name ' . $problem;
+                }
+            }
             if (isset($properties[$key])) {
                 $errors = array_merge($errors, $this->check($child, $properties[$key], $path . '.' . $key));
                 continue;

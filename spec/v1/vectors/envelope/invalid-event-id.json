@@ -1,0 +1,24 @@
+{
+  "description": "event_id が UUIDv4 でない（v1）",
+  "valid": false,
+  "schema_rejects": true,
+  "envelope": {
+    "sdk": {
+      "name": "@ah-monica/core",
+      "version": "1.0.0"
+    },
+    "sent_at": "2026-08-30T00:00:00.000Z",
+    "discarded": 0,
+    "items": [
+      {
+        "type": "error",
+        "event_id": "123e4567-e89b-12d3-a456-426614174000",
+        "timestamp": "2026-08-30T00:00:00.000Z",
+        "level": "error",
+        "platform": "javascript",
+        "environment": "production",
+        "message": "boom"
+      }
+    ]
+  }
+}

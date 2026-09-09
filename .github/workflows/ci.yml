@@ -1,9 +1,31 @@
 name: ci
 
+# PHP SDK の検査。見るのは 4 つ。
+#
+#   - test:    対応する PHP 全版で振る舞いと契約テストが通ること
+#   - spec:    取り込んだ公開契約が配信元から動いていないこと
+#   - package: Packagist が配る tarball の中身と、それだけで autoload できること
+#   - release: タグと SDK_VERSION が一致すること（タグを打ったときだけ）
+#
+# PHP の版は 7.4 / 8.0 / 8.3。下限が対応保証の下限で、7.4 は composer.json の
+# require、8.0 は導入先の実行環境、8.3 は現行安定版。
+
 on:
   pull_request:
   push:
     branches: [main]
+    # タグでも回す。release job のためだけでなく、配布される commit で
+    # test / spec / package が通っていることを残すため。
+    #
+    # `v` 無しも拾う。Packagist は先頭の `v` を落として version にするので、
+    # `0.1.1` というタグでも配布は成立してしまう。ここで拾っておかないと、
+    # 綴りを外したタグだけが検査を素通りする。
+    tags: ["v*", "[0-9]*"]
+  schedule:
+    # 公開契約は MONICA 側の都合で動く。PR が来るまで気付かないと、
+    # 気付いたときには「無関係な PR が落ちる」形で出てくる。
+    - cron: "17 21 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,45 +42,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # composer.json requires >=7.4, Liew runs 8.0, 8.3 is the current stable.
         php: ["7.4", "8.0", "8.3"]
     steps:
-      # submodule はここでは取らない。checkout に任せると、private repository が
-      # 404 で返るせいで「repository not found」だけが出て原因が読めない。
       - uses: actions/checkout@v6
-
-      # .spec-src は private な Accel-Hack/monica を指すので、GITHUB_TOKEN では読めない。
-      # 全 SDK repository が同じ App を使えるよう、token は GitHub App から作る。
-      # App が未設定でも失敗の理由が読めるよう、ここでは落とさず次の step で判定する。
-      - name: 仕様repositoryのread tokenを作る
-        id: spec-token
-        continue-on-error: true
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.SPEC_APP_ID }}
-          private-key: ${{ secrets.SPEC_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: monica
-
-      - name: 仕様submoduleを取得
-        env:
-          # App が入るまでは PAT を SPEC_READ_TOKEN に置いても動く。
-          SPEC_TOKEN: ${{ steps.spec-token.outputs.token || secrets.SPEC_READ_TOKEN }}
-        run: |
-          if [ -z "$SPEC_TOKEN" ]; then
-            echo "::error::Accel-Hack/monica を読む token がありません。private repository は 403 ではなく 404 を返すため、GITHUB_TOKEN では submodule が「repository not found」になります。organization variable SPEC_APP_ID と secret SPEC_APP_PRIVATE_KEY に、Accel-Hack/monica の Contents:read を持つ GitHub App を設定してください（暫定なら secret SPEC_READ_TOKEN に PAT でも動きます）。"
-            exit 1
-          fi
-          # 記録された commit を取りたいので checkout ではなく submodule update を使う。
-          git -c "url.https://x-access-token:$SPEC_TOKEN@github.com/.insteadOf=https://github.com/" \
-            submodule update --init --depth 1 .spec-src
-          # spec/ 以外は要らない。README が案内する手順が CI でも成立することの確認も兼ねる。
-          git -C .spec-src sparse-checkout init --cone
-          git -C .spec-src sparse-checkout set spec
-          if [ ! -f .spec-src/spec/event-schema.json ]; then
-            echo "::error::.spec-src/spec/event-schema.json がありません。submodule は取れましたが spec/ が入っていません。"
-            exit 1
-          fi
 
       - uses: shivammathur/setup-php@v2
         with:
@@ -82,3 +68,131 @@ jobs:
           composer validate --strict
           composer install --no-interaction --prefer-dist
           composer test
+
+  spec:
+    # 配信元を叩くので matrix から外してある。network の失敗で PHP 3 版の
+    # job が道連れになると、落ちた理由が読めなくなる。
+    name: 公開契約
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: curl, json
+          coverage: none
+
+      - name: 取り込んだ specが配信元と一致するか
+        # spec/ は https://spec.monica.accelhack.net/v1/ のコピー。配信元の
+        # index.json の revision を取り込み済みのものと比べるだけなので安い。
+        # ここが落ちたら php scripts/spec-sync.php で取り込み直し、契約テストを
+        # 通してから commit する。
+        run: php scripts/spec-sync.php --check-remote
+
+  package:
+    name: 配布物
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: json, zlib
+          coverage: none
+
+      - name: 配布物に開発用のファイルが入っていないか
+        # .gitattributes の export-ignore は書いた本人にしか見えない。Packagist が
+        # 配る tarball は git archive なので、そこで実際に確かめる。
+        run: |
+          git archive --format=tar HEAD > /tmp/package.tar
+          tar -tf /tmp/package.tar | sort > /tmp/contents.txt
+          sed 's/^/  /' /tmp/contents.txt
+          for excluded in spec/ spec.lock.json scripts/ tests/ .github/; do
+            if grep -q "^$excluded" /tmp/contents.txt; then
+              echo "::error::配布物に $excluded が入っています。.gitattributes の export-ignore を確認してください。"
+              exit 1
+            fi
+          done
+          for required in src/Monica.php composer.json bin/monica LICENSE; do
+            if ! grep -qx "$required" /tmp/contents.txt; then
+              echo "::error::配布物に $required がありません。"
+              exit 1
+            fi
+          done
+
+      - name: 配布物だけでautoloadできるか
+        # tests/ も vendor/ も無い状態で、src/ が読み込めることを見る。
+        # PSR-4 の綴りや大文字小文字の取り違えは、ここでしか出ない。
+        run: |
+          mkdir -p /tmp/dist && tar -xf /tmp/package.tar -C /tmp/dist
+          cd /tmp/dist
+          composer install --no-interaction --no-dev --prefer-dist
+          php -r 'require "vendor/autoload.php";
+            foreach ([
+              Monica\Monica::class,
+              Monica\Client::class,
+              Monica\EventFactory::class,
+              Monica\Transport\CurlTransport::class,
+              Monica\Transport\Psr18Transport::class,
+              Monica\Transport\SpoolTransport::class,
+              Monica\Transport\SpoolFlusher::class,
+              Monica\Transport\Dsn::class,
+            ] as $class) {
+              if (!class_exists($class)) {
+                fwrite(STDERR, $class . " is not autoloadable from the published package\n");
+                exit(1);
+              }
+            }
+            echo "autoload ok\n";'
+
+  release:
+    name: リリースタグ
+    # Packagist は push webhook で version を拾うので、この job は配布を
+    # 止められない（webhook は CI の結果を待たない）。目的は「食い違ったまま
+    # 気付かない」を無くすこと。落ちたらタグを消して打ち直す。
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: none
+
+      - name: タグとSDK_VERSIONが一致するか
+        # SDK_VERSION は src/Client.php の手書き定数で、そのまま全 event の
+        # sdk.version として出る。ingest.md がこれを取り込み状況の集計単位と
+        # 定めているので、タグと食い違うと集計が狂う。source を正規表現で
+        # 読まず PHP 自身に読ませるのは、定数の書き方を変えても壊れないため。
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::タグ $tag が v<semver> の形ではありません。既にある v0.1.0 に合わせて v を付けてください。"
+            exit 1
+          fi
+          expected="${tag#v}"
+          declared="$(php -r 'require "src/Client.php"; echo Monica\Client::SDK_VERSION;')"
+          if [ "$declared" != "$expected" ]; then
+            echo "::error::タグ $tag と src/Client.php の SDK_VERSION ($declared) が一致しません。全 event の sdk.version は $declared として出るので、定数を $expected に直してからタグを打ち直してください。"
+            exit 1
+          fi
+          echo "tag $tag = SDK_VERSION $declared"
+
+      - name: composer.jsonがversionを宣言していないか
+        # version の出所を「タグ」と「SDK_VERSION」の 2 つに留める。composer.json
+        # にも version があると 3 つ目の食い違いが生まれ、上の検査を通しても
+        # Packagist が別の版を配ることになる。
+        run: |
+          php -r '$c = json_decode(file_get_contents("composer.json"), true);
+            if (isset($c["version"])) {
+              fwrite(STDERR, "composer.json declares version " . $c["version"]
+                . "; Packagist derives the version from the tag, so remove it\n");
+              exit(1);
+            }
+            echo "composer.json leaves the version to the tag\n";'

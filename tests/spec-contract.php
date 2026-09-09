@@ -3,12 +3,26 @@
 declare(strict_types=1);
 
 /**
- * Contract test against the language-neutral protocol specification.
+ * Contract test against MONICA's public contract bundle.
  *
- * The spec is not owned by this repository: it comes from the `spec/`
- * directory of Accel-Hack/monica, pulled in as a submodule. Every envelope
- * this SDK is able to emit is validated against `spec/event-schema.json`, so a
- * change to the shared contract fails here instead of failing in ingest.
+ * The contract is not owned by this repository. MONICA publishes it at
+ * https://spec.monica.accelhack.net/v1/ and `scripts/spec-sync.php` vendors a
+ * copy into `spec/`. This test runs against that copy, so a change to the
+ * shared contract fails here instead of failing in ingest.
+ *
+ * Three layers are checked, because the bundle itself says the schema is not
+ * the whole contract:
+ *
+ *   1. the schema still says what this SDK relies on (`envelope.json`,
+ *      `limits.json`)
+ *   2. MONICA's own test vectors get the verdict the bundle expects
+ *   3. every envelope this SDK can emit satisfies the schema *and* the
+ *      obligations `payload.md` and `ingest.md` state in prose
+ *
+ * Layer 3 matters most. `payload.md` is explicit that a payload can satisfy
+ * the published schema and still be rejected by ingest — timestamps are the
+ * example the bundle ships vectors for — so passing the schema is not
+ * evidence that the SDK is correct.
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -22,6 +36,7 @@ error_reporting(E_ALL);
 use Monica\Client;
 use Monica\EventFactory;
 use Monica\Tests\Spec\JsonSchema;
+use Monica\Transport\Dsn;
 use Monica\Transport\TransportInterface;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Http\Client\ClientInterface;
@@ -76,7 +91,7 @@ function assertValid(JsonSchema $schema, array $envelope, string $label): void
 {
     $errors = $schema->validate(wire($envelope));
     if ($errors !== []) {
-        fail($label . ' does not satisfy event-schema.json:' . PHP_EOL . '  - ' . implode(PHP_EOL . '  - ', $errors));
+        fail($label . ' does not satisfy envelope.json:' . PHP_EOL . '  - ' . implode(PHP_EOL . '  - ', $errors));
     }
 }
 
@@ -86,65 +101,270 @@ function assertValid(JsonSchema $schema, array $envelope, string $label): void
 function assertRejected(JsonSchema $schema, $envelope, string $label): void
 {
     if ($schema->validate($envelope) === []) {
-        fail('event-schema.json should reject ' . $label);
+        fail('envelope.json should reject ' . $label);
     }
 }
 
-function specDirectory(): string
+/**
+ * The vendored bundle, verified against `spec.lock.json` before anything reads
+ * it. A hand-edited spec would turn this whole file into a test of nothing.
+ *
+ * @return array{directory: string, revision: string}
+ */
+function vendoredSpec(): array
 {
     $root = dirname(__DIR__);
-    // `.spec-src` is the Accel-Hack/monica submodule; a bare `spec/` supports a
-    // checkout that vendors the spec directly.
-    foreach (['/.spec-src/spec', '/spec'] as $candidate) {
-        if (is_file($root . $candidate . '/event-schema.json')) {
-            return $root . $candidate;
+    $lock = json_decode((string) @file_get_contents($root . '/spec.lock.json'), true);
+    if (
+        !is_array($lock)
+        || !isset($lock['version'], $lock['revision'], $lock['files'])
+        || !is_array($lock['files'])
+    ) {
+        fail('spec.lock.json is missing or unreadable; see README.md');
+    }
+    $directory = $root . '/spec/' . $lock['version'];
+
+    $digests = [];
+    foreach ($lock['files'] as $path => $expected) {
+        $file = $directory . '/' . $path;
+        if (!is_file($file)) {
+            fail(
+                'spec/' . $lock['version'] . '/' . $path . ' is not vendored. The contract lives in'
+                . ' MONICA and is pulled in by a script:' . PHP_EOL
+                . '  php scripts/spec-sync.php' . PHP_EOL
+                . 'This test must not be skipped: without it a change to the shared contract'
+                . ' would only be caught in ingest.'
+            );
+        }
+        $actual = hash('sha256', (string) file_get_contents($file));
+        if ($actual !== $expected) {
+            fail(
+                'spec/' . $lock['version'] . '/' . $path . ' does not match spec.lock.json. Run'
+                . ' `php scripts/spec-sync.php` instead of editing the vendored copy.'
+            );
+        }
+        $digests[$path] = (string) $expected;
+    }
+
+    // `revision` is MONICA's fingerprint for the whole bundle. Recomputing it
+    // from the digests means a lock whose entries were edited to agree with a
+    // doctored spec still fails here.
+    ksort($digests, SORT_STRING);
+    $lines = [];
+    foreach ($digests as $path => $digest) {
+        $lines[] = $digest . '  ' . $path;
+    }
+    if (hash('sha256', implode("\n", $lines)) !== $lock['revision']) {
+        fail('spec.lock.json: revision does not match its own files; run `php scripts/spec-sync.php`');
+    }
+
+    return ['directory' => $directory, 'revision' => (string) $lock['revision']];
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function readJson(string $path): array
+{
+    $decoded = json_decode((string) file_get_contents($path), true);
+    expect(is_array($decoded), $path . ' should decode to a JSON object');
+
+    /** @var array<string, mixed> $decoded */
+    return $decoded;
+}
+
+/**
+ * RFC 3339 date-time with a timezone, on a date the calendar actually has.
+ *
+ * `envelope.json` only says `type: "string"` here: the two rules below are
+ * prose in payload.md, and MONICA answers 422 when they are broken. The
+ * bundle ships `space-separated-timestamp` and `impossible-calendar-date` as
+ * vectors with `schema_rejects: false` for exactly this reason.
+ */
+function isRfc3339(string $value): bool
+{
+    $matched = preg_match(
+        '~^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$~',
+        $value,
+        $parts
+    );
+    if ($matched !== 1) {
+        return false;
+    }
+
+    return checkdate((int) $parts[2], (int) $parts[3], (int) $parts[1])
+        && (int) $parts[4] < 24 && (int) $parts[5] < 60 && (int) $parts[6] < 61;
+}
+
+/**
+ * Every stack frame in an envelope, so the frame-level obligations can be
+ * checked without knowing which item produced them.
+ *
+ * @param array<string, mixed> $envelope
+ * @return list<array<string, mixed>>
+ */
+function framesIn(array $envelope): array
+{
+    $frames = [];
+    foreach ($envelope['items'] as $item) {
+        foreach ($item['exception']['values'] ?? [] as $value) {
+            foreach ($value['stacktrace']['frames'] ?? [] as $frame) {
+                $frames[] = $frame;
+            }
         }
     }
 
-    fail(
-        'spec/event-schema.json not found. The protocol spec is a submodule; run' . PHP_EOL
-        . '  git submodule update --init --depth 1' . PHP_EOL
-        . 'and see README.md. This test must not be skipped: without it a change to the'
-        . ' shared contract would only be caught in ingest.'
-    );
+    return $frames;
 }
 
-$specDirectory = specDirectory();
-$schema = JsonSchema::fromFile($specDirectory . '/event-schema.json');
+$vendored = vendoredSpec();
+$specDirectory = $vendored['directory'];
+$schema = JsonSchema::fromFile($specDirectory . '/envelope.json');
+$limits = readJson($specDirectory . '/limits.json');
+$transportSpec = readJson($specDirectory . '/transport.json');
 
-// --- the spec itself still says what this SDK relies on -------------------
+// --- 1. the spec itself still says what this SDK relies on ---------------
 
 expect(
     $schema->pointer('/$schema') === 'https://json-schema.org/draft/2020-12/schema',
-    'event-schema.json must use JSON Schema draft 2020-12'
+    'envelope.json must use JSON Schema draft 2020-12'
 );
 expect(
-    $schema->pointer('/properties/items/maxItems') === 100,
-    'event-schema.json must enforce the 100-item envelope limit'
+    $schema->pointer('/$id') === 'https://spec.monica.accelhack.net/v1/envelope.json',
+    'envelope.json must still be the v1 bundle this SDK targets'
 );
+
+// limits.json is the machine-readable copy of the table in ingest.md. If the
+// two ever disagree, the SDK would be sized against the wrong one.
+expect(
+    $schema->pointer('/properties/items/maxItems') === $limits['items_per_envelope'],
+    'envelope.json and limits.json must agree on the item limit'
+);
+expect(
+    $schema->pointer('/$defs/exceptionValue/properties/stacktrace/properties/frames/maxItems')
+        === $limits['frames_per_stacktrace'],
+    'envelope.json and limits.json must agree on the frame limit'
+);
+expect($limits['items_per_envelope'] === 100, 'this SDK batches to 100 items per envelope');
+expect($limits['frames_per_stacktrace'] === 200, 'this SDK truncates stack traces to 200 frames');
+
 $platforms = $schema->pointer('/$defs/errorItem/properties/platform/enum');
 expect(
     is_array($platforms) && in_array('php', $platforms, true),
-    'event-schema.json must accept the php platform'
+    'envelope.json must accept the php platform'
 );
 $mechanisms = $schema->pointer('/$defs/mechanism/properties/type/enum');
 expect(
     is_array($mechanisms) && in_array('generic', $mechanisms, true),
-    'event-schema.json must accept the generic mechanism this SDK emits'
+    'envelope.json must accept the generic mechanism this SDK emits'
 );
 
+// payload.md says the schema now expresses the *shape* of a timestamp, which is
+// what moves `space-separated-timestamp` to a vector the schema can reject. The
+// prose keeps only "the date must exist in the calendar". If the pattern ever
+// goes away, this fails rather than leaving isRfc3339 below as the sole guard.
+foreach ([
+    '/properties/sent_at/pattern',
+    '/$defs/errorItem/properties/timestamp/pattern',
+    '/$defs/breadcrumb/properties/timestamp/pattern',
+] as $pointer) {
+    expect(
+        is_string($schema->pointer($pointer)) && $schema->pointer($pointer) !== '',
+        'envelope.json must constrain the timestamp shape at ' . $pointer
+    );
+}
+
+// error.json is the shape of a rejection. This SDK does not read the body yet:
+// its transports only distinguish 2xx from everything else, and the retry
+// policy in transport.json is unimplemented (see README). So what is pinned
+// here is the schema being usable and the two fields a retry implementation
+// will need, not conformance the SDK does not yet have.
+$errorSchema = JsonSchema::fromFile($specDirectory . '/error.json');
+expect(
+    $errorSchema->pointer('/$id') === 'https://spec.monica.accelhack.net/v1/error.json',
+    'error.json must still be the v1 error schema'
+);
+expect(
+    $errorSchema->pointer('/$defs/validationIssue/required') === ['path', 'message'],
+    'a 422 issue must keep carrying both a path and a message'
+);
+$documentedRejection = json_decode(
+    '{"error":{"code":"invalid_envelope","message":"The envelope does not match the MONICA schema",'
+    . '"issues":[{"path":"$.items[0].exception.values[0].mechanism.type","message":"Invalid type"}]}}',
+    false
+);
+$rejectionErrors = $errorSchema->validate($documentedRejection);
+if ($rejectionErrors !== []) {
+    fail(
+        'the rejection shape documented in ingest.md does not satisfy error.json:' . PHP_EOL
+        . '  - ' . implode(PHP_EOL . '  - ', $rejectionErrors)
+    );
+}
+
 $definitions = $schema->definitionNames();
-$serialized = (string) file_get_contents($specDirectory . '/event-schema.json');
+$serialized = (string) file_get_contents($specDirectory . '/envelope.json');
 preg_match_all('~#/\$defs/([A-Za-z0-9_-]+)~', $serialized, $references);
 foreach ($references[1] as $reference) {
     expect(in_array($reference, $definitions, true), 'unknown schema reference: #/$defs/' . $reference);
 }
 
-// --- every envelope this SDK can emit satisfies the schema ---------------
+// --- 2. MONICA's own test vectors get the verdict the bundle expects -----
+
+// A vector says both whether MONICA accepts the envelope (`valid`) and
+// whether the published schema is able to see the problem
+// (`schema_rejects`). Only the second is this validator's business; the first
+// is checked against the SDK's own output further down.
+$vectorFiles = glob($specDirectory . '/vectors/envelope/*.json') ?: [];
+sort($vectorFiles, SORT_STRING);
+expect($vectorFiles !== [], 'the bundle must ship envelope test vectors');
+
+$semanticOnly = 0;
+foreach ($vectorFiles as $vectorFile) {
+    $name = basename($vectorFile, '.json');
+    $vector = json_decode((string) file_get_contents($vectorFile), false);
+    expect(
+        is_object($vector) && property_exists($vector, 'valid') && property_exists($vector, 'envelope'),
+        $name . ': a vector needs `valid` and `envelope`'
+    );
+
+    // Absent means "the schema agrees with `valid`", which is how every
+    // accepted vector in the bundle is written.
+    $schemaRejects = property_exists($vector, 'schema_rejects')
+        ? (bool) $vector->schema_rejects
+        : !$vector->valid;
+    $errors = $schema->validate($vector->envelope);
+
+    if ($schemaRejects) {
+        if ($errors !== []) {
+            continue;
+        }
+        fail('vector ' . $name . ' should be rejected by envelope.json (' . $vector->description . ')');
+    }
+
+    if ($errors !== []) {
+        fail(
+            'vector ' . $name . ' should satisfy envelope.json (' . $vector->description . '):' . PHP_EOL
+            . '  - ' . implode(PHP_EOL . '  - ', $errors)
+        );
+    }
+    if (!$vector->valid) {
+        // Passing the schema is not the same as being accepted. Keeping a
+        // count here means the SDK-side checks below cannot become the only
+        // thing standing between us and a 422 without anyone noticing.
+        $semanticOnly++;
+    }
+}
+expect(
+    $semanticOnly > 0,
+    'the bundle should still carry vectors that the schema cannot reject; if it no longer'
+    . ' does, the prose obligations below may have moved into the schema'
+);
+
+// --- 3. every envelope this SDK can emit satisfies the schema ------------
 
 $transport = new CapturingTransport();
 $client = new Client([
-    'dsn' => 'https://secret@ingest.example.test/1',
+    'dsn' => 'https://msk_secret@ingest.example.test/1',
     'environment' => 'contract',
     'release' => '1.2.3',
     'server_name' => 'contract-host',
@@ -178,7 +398,8 @@ $client->captureException(
     ]
 );
 expect($client->flush(), 'the capturing transport should accept the envelope');
-assertValid($schema, $transport->envelopes[0], 'a captured exception with full context');
+$chained = $transport->envelopes[0];
+assertValid($schema, $chained, 'a captured exception with full context');
 
 $transport->envelopes = [];
 foreach (['fatal', 'error', 'warning', 'info', 'debug'] as $level) {
@@ -193,9 +414,10 @@ $client->captureException(new RuntimeException('unhandled'), [
 $client->handleError(E_USER_NOTICE, 'a notice', __FILE__, __LINE__);
 $client->handleError(E_USER_WARNING, 'a warning', '', 0);
 expect($client->flush(), 'the capturing transport should accept the second envelope');
-assertValid($schema, $transport->envelopes[0], 'messages, an unhandled exception and PHP errors');
+$mixed = $transport->envelopes[0];
+assertValid($schema, $mixed, 'messages, an unhandled exception and PHP errors');
 expect(
-    count($transport->envelopes[0]['items']) === 8,
+    count($mixed['items']) === 8,
     'every level, the unhandled exception and both PHP errors should be in the envelope'
 );
 
@@ -218,26 +440,54 @@ expect($fatalEnvelope['items'][0]['level'] === 'fatal', 'E_ERROR should be repor
 // part of the contract, not an implementation detail.
 $overflowTransport = new CapturingTransport();
 $overflowClient = new Client([
-    'dsn' => 'https://secret@ingest.example.test/1',
+    'dsn' => 'https://msk_secret@ingest.example.test/1',
     'environment' => 'contract',
     'transport_instance' => $overflowTransport,
     'auto_capture' => false,
-    'max_queue_size' => 100,
-    'batch_size' => 100,
+    'max_queue_size' => $limits['items_per_envelope'],
+    'batch_size' => $limits['items_per_envelope'],
 ]);
-for ($index = 0; $index < 105; $index++) {
+for ($index = 0; $index < $limits['items_per_envelope'] + 5; $index++) {
     $overflowClient->captureMessage('overflow ' . $index);
 }
 expect($overflowClient->flush(), 'the overflow envelope should be accepted');
 $overflow = $overflowTransport->envelopes[0];
-expect(count($overflow['items']) === 100, 'a full envelope should carry exactly 100 items');
+expect(
+    count($overflow['items']) === $limits['items_per_envelope'],
+    'a full envelope should carry exactly ' . $limits['items_per_envelope'] . ' items'
+);
 expect($overflow['discarded'] === 5, 'dropped events should be reported as discarded');
 assertValid($schema, $overflow, 'a full envelope reporting discarded events');
+
+// The item limit belongs to MONICA, not to this SDK's defaults. Asking for a
+// larger batch must still split, or ingest answers 422 on an envelope the
+// application had no way to see was too big.
+$splitTransport = new CapturingTransport();
+$splitClient = new Client([
+    'dsn' => 'https://msk_secret@ingest.example.test/1',
+    'environment' => 'contract',
+    'transport_instance' => $splitTransport,
+    'auto_capture' => false,
+    'max_queue_size' => $limits['items_per_envelope'] * 4,
+    'batch_size' => $limits['items_per_envelope'] * 4,
+]);
+for ($index = 0; $index < $limits['items_per_envelope'] + 50; $index++) {
+    $splitClient->captureMessage('split ' . $index);
+}
+expect($splitClient->flush(), 'an over-sized batch should still be accepted');
+expect(count($splitTransport->envelopes) === 2, 'an over-sized batch should be split across envelopes');
+foreach ($splitTransport->envelopes as $position => $envelope) {
+    expect(
+        count($envelope['items']) <= $limits['items_per_envelope'],
+        'envelope ' . $position . ' carries more than the published item limit'
+    );
+    assertValid($schema, $envelope, 'a split envelope');
+}
 
 // Non-ASCII and control characters survive JSON encoding intact.
 $unicodeTransport = new CapturingTransport();
 $unicodeClient = new Client([
-    'dsn' => 'https://secret@ingest.example.test/1',
+    'dsn' => 'https://msk_secret@ingest.example.test/1',
     'environment' => '本番',
     'transport_instance' => $unicodeTransport,
     'auto_capture' => false,
@@ -246,7 +496,197 @@ $unicodeClient->captureException(new RuntimeException("結合できません\tid
 expect($unicodeClient->flush(), 'the unicode envelope should be accepted');
 assertValid($schema, $unicodeTransport->envelopes[0], 'a non-ASCII envelope');
 
-// The bytes that actually go over the wire, not just the PHP array.
+// --- 4. the payload obligations the schema cannot express (payload.md) ---
+
+$sdkEnvelopes = [$chained, $mixed, $fatalEnvelope, $overflow, $unicodeTransport->envelopes[0]];
+
+foreach ($sdkEnvelopes as $position => $envelope) {
+    expect(
+        isRfc3339((string) $envelope['sent_at']),
+        'envelope #' . $position . ': sent_at "' . $envelope['sent_at']
+            . '" is not an RFC 3339 date-time with a timezone'
+    );
+    expect(
+        $envelope['sdk']['name'] !== '' && $envelope['sdk']['version'] !== '',
+        'envelope #' . $position . ': sdk.name and sdk.version must not be empty'
+    );
+    // JavaScript's safe integer range is not in the JSON Schema vocabulary, so
+    // `unsafe-discarded-count` is a vector the schema cannot reject.
+    expect(
+        $envelope['discarded'] >= 0 && $envelope['discarded'] <= 9007199254740991,
+        'envelope #' . $position . ': discarded must stay inside the safe integer range'
+    );
+
+    foreach ($envelope['items'] as $item) {
+        expect(
+            isRfc3339((string) $item['timestamp']),
+            'envelope #' . $position . ': timestamp "' . $item['timestamp'] . '" is not RFC 3339'
+        );
+        foreach ($item['breadcrumbs'] ?? [] as $breadcrumb) {
+            expect(
+                !isset($breadcrumb['timestamp']) || isRfc3339((string) $breadcrumb['timestamp']),
+                'envelope #' . $position . ': a breadcrumb timestamp is not RFC 3339'
+            );
+        }
+    }
+
+    foreach (framesIn($envelope) as $frame) {
+        // An empty filename passes the schema's `minLength: 1` only because
+        // the SDK substitutes a placeholder; payload.md forbids the empty one.
+        expect(
+            $frame['filename'] !== '',
+            'envelope #' . $position . ': a stack frame has an empty filename'
+        );
+    }
+}
+
+// exception.values runs outermost first, following getPrevious(). Reversing it
+// splits one exception into two issues.
+$values = $chained['items'][0]['exception']['values'];
+expect(count($values) === 2, 'the cause chain should carry both exceptions');
+expect($values[0]['type'] === 'RuntimeException', 'exception.values should start at the outermost throwable');
+expect($values[1]['type'] === 'LogicException', 'exception.values should follow getPrevious() inwards');
+
+// frames run oldest caller first, throw site last. This is the direction every
+// MONICA SDK uses, and the one grouping assumes. Two levels of calls are needed
+// to pin the direction: with a throwable raised at the top of this file the
+// trace is a single frame, and both orderings look the same.
+function specThrowSite(): RuntimeException
+{
+    return new RuntimeException('locate the throw site');
+}
+
+function specCallSite(): RuntimeException
+{
+    return specThrowSite();
+}
+
+$throwSite = specCallSite();
+$located = (new EventFactory('contract', null, dirname(__DIR__)))->fromThrowable($throwSite);
+$locatedFrames = $located['exception']['values'][0]['stacktrace']['frames'];
+expect(count($locatedFrames) === 3, 'the trace should hold both calls and the throw site');
+expect(
+    $locatedFrames[0]['function'] === 'specCallSite',
+    'the first frame should be the oldest caller'
+);
+expect(
+    $locatedFrames[1]['function'] === 'specThrowSite',
+    'frames should run from the oldest caller towards the throw site'
+);
+$last = $locatedFrames[2];
+expect(
+    $last['filename'] === $throwSite->getFile() && $last['lineno'] === $throwSite->getLine(),
+    'the last frame should be where the exception was thrown'
+);
+
+// Deep recursion must be truncated rather than sent whole: ingest rejects an
+// envelope whose stacktrace exceeds the published frame limit.
+function specRecurse(int $depth): RuntimeException
+{
+    return $depth > 0 ? specRecurse($depth - 1) : new RuntimeException('deep');
+}
+$deep = (new EventFactory('contract', null, dirname(__DIR__)))
+    ->fromThrowable(specRecurse($limits['frames_per_stacktrace'] + 50));
+expect(
+    count($deep['exception']['values'][0]['stacktrace']['frames']) === $limits['frames_per_stacktrace'],
+    'a stacktrace deeper than the limit should be truncated to ' . $limits['frames_per_stacktrace'] . ' frames'
+);
+
+// in_app is the SDK's judgement about whose code a frame is, not a copy of the
+// path. Marking everything false groups every error at the framework.
+$inAppFactory = new EventFactory('contract', null, '/srv/app');
+$vendorError = $inAppFactory->fromPhpError(E_WARNING, 'in vendor', '/srv/app/vendor/acme/lib/Client.php', 12, true);
+$appError = $inAppFactory->fromPhpError(E_WARNING, 'in app', '/srv/app/src/Handler.php', 12, true);
+expect(
+    $vendorError['exception']['values'][0]['stacktrace']['frames'][0]['in_app'] === false,
+    'vendor/ frames must not be marked in_app'
+);
+expect(
+    $appError['exception']['values'][0]['stacktrace']['frames'][0]['in_app'] === true,
+    'frames under the project root must be marked in_app'
+);
+
+// fingerprint is the user's grouping key: it goes out exactly as given, and
+// never as an empty array.
+expect(
+    $chained['items'][0]['fingerprint'] === ['things', 'POST'],
+    'fingerprint must reach the wire unchanged: no trimming, normalising or joining'
+);
+expect($chained['items'][0]['fingerprint'] !== [], 'fingerprint must not be an empty array');
+
+// --- 5. the request the SDK actually makes (transport.json) -------------
+
+// transport.json is the machine-readable copy of the tables in ingest.md, so
+// everything below is driven by the spec rather than by constants copied out of
+// its prose. A change on MONICA's side arrives here as a failure.
+$endpoint = $transportSpec['endpoint'];
+$authSchemes = [];
+foreach ($transportSpec['auth'] as $scheme) {
+    $authSchemes[$scheme['kind']] = $scheme;
+}
+expect(
+    isset($authSchemes['secret'], $authSchemes['public']),
+    'transport.json should describe both a secret and a public key scheme'
+);
+
+// This SDK implements only part of transport.json: the endpoint and the secret
+// key scheme. The status table and the retry policy have no consumer yet -- the
+// transports return a bool and never retry. Pinning the vocabulary here turns
+// "MONICA grew an obligation the PHP SDK ignores" into a failing test instead of
+// a silent gap.
+$implemented = ['endpoint', 'dsn', 'auth'];
+$unimplemented = ['status', 'retry'];
+$declared = array_keys($transportSpec);
+sort($declared, SORT_STRING);
+$accounted = array_merge($implemented, $unimplemented);
+sort($accounted, SORT_STRING);
+expect(
+    $declared === $accounted,
+    'transport.json declares sections this SDK has not considered: '
+    . implode(', ', array_diff($declared, $accounted))
+    . ' (see README for what is intentionally unimplemented)'
+);
+$knownStatuses = ['202', '400', '401', '413', '422', '429', '5xx'];
+// json_decode(..., true) turns "202" into an int array key, so the keys have to
+// be cast back before they can be compared with the vocabulary above.
+$actualStatuses = array_map('strval', array_keys($transportSpec['status']));
+sort($actualStatuses, SORT_STRING);
+sort($knownStatuses, SORT_STRING);
+expect(
+    $actualStatuses === $knownStatuses,
+    'transport.json changed the status vocabulary: ' . implode(', ', $actualStatuses)
+);
+expect(
+    $transportSpec['status']['202'] === 'accept',
+    'a 202 must still mean the envelope left the queue, which is all this SDK acts on'
+);
+
+// The DSN path is not the ingest path. Sending to the DSN's trailing digits
+// would post to a project id that MONICA does not route on.
+$parsed = Dsn::parse('https://msk_secret@ingest.example.test/1?q=1#f');
+expect(
+    $parsed['endpoint'] === 'https://ingest.example.test' . $endpoint['path'],
+    'the DSN path, query and fragment must be dropped in favour of ' . $endpoint['path']
+);
+
+// https everywhere, except the hosts transport.json names.
+foreach ($transportSpec['dsn']['insecure_hosts'] as $host) {
+    $accepted = true;
+    try {
+        Dsn::parse('http://msk_secret@' . $host . '/1');
+    } catch (InvalidArgumentException $rejected) {
+        $accepted = false;
+    }
+    expect($accepted, 'plain http must be allowed for ' . $host);
+}
+$insecureRejected = false;
+try {
+    Dsn::parse('http://msk_secret@ingest.example.test/1');
+} catch (InvalidArgumentException $rejected) {
+    $insecureRejected = true;
+}
+expect($insecureRejected, 'plain http must be rejected for hosts outside dsn.insecure_hosts');
+
 if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class)) {
     $factory = new Psr17Factory();
     $httpClient = new class($factory) implements ClientInterface {
@@ -268,8 +708,9 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
             return $this->factory->createResponse(202);
         }
     };
+    $secretKey = $authSchemes['secret']['key_prefix'] . 'contract';
     $wireClient = new Client([
-        'dsn' => 'https://secret@ingest.example.test/1',
+        'dsn' => 'https://' . $secretKey . '@ingest.example.test/1',
         'environment' => 'contract',
         'http_client' => $httpClient,
         'request_factory' => $factory,
@@ -278,21 +719,65 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
     ]);
     $wireClient->captureException(new RuntimeException('over the wire'));
     expect($wireClient->flush(), 'the PSR-18 transport should accept a 202 response');
-    expect($httpClient->request instanceof RequestInterface, 'the PSR-18 client should receive a request');
-    $body = gzdecode((string) $httpClient->request->getBody());
+    $request = $httpClient->request;
+    expect($request instanceof RequestInterface, 'the PSR-18 client should receive a request');
+
+    expect(
+        $request->getMethod() === $endpoint['method'],
+        'the envelope must be sent with ' . $endpoint['method']
+    );
+    expect(
+        (string) $request->getUri() === 'https://ingest.example.test' . $endpoint['path'],
+        'the envelope must go to ' . $endpoint['path']
+    );
+    expect(
+        $request->getHeaderLine('Content-Type') === $endpoint['content_type'],
+        'the envelope must be declared as ' . $endpoint['content_type']
+    );
+    expect(
+        $request->getHeaderLine('Content-Encoding') === $endpoint['content_encoding'],
+        'the envelope must be declared as ' . $endpoint['content_encoding'] . '-encoded'
+    );
+
+    // A secret key authenticates with the header transport.json gives for its
+    // kind, and must not use the public-key header a server SDK never issues.
+    expect(
+        $request->getHeaderLine($authSchemes['secret']['header'])
+            === str_replace('<key>', $secretKey, $authSchemes['secret']['value']),
+        'a secret key must be sent as ' . $authSchemes['secret']['header'] . ': '
+            . $authSchemes['secret']['value']
+    );
+    expect(
+        $request->getHeaderLine($authSchemes['public']['header']) === '',
+        'a server SDK must not use the public-key header ' . $authSchemes['public']['header']
+    );
+
+    $raw = (string) $request->getBody();
+    $body = gzdecode($raw);
     expect($body !== false, 'the request body should be gzipped JSON');
+    expect(
+        strlen($raw) <= $limits['envelope_gzip_bytes'],
+        'the gzipped envelope must stay under ' . $limits['envelope_gzip_bytes'] . ' bytes'
+    );
+    expect(
+        strlen((string) $body) <= $limits['envelope_decompressed_bytes'],
+        'the decompressed envelope must stay under ' . $limits['envelope_decompressed_bytes'] . ' bytes'
+    );
+
+    // One request carries one envelope: the body is a single JSON value, not a
+    // concatenation of them.
     $decoded = json_decode((string) $body, false);
-    expect(is_object($decoded), 'the request body should decode to an envelope');
+    expect(is_object($decoded), 'the request body should decode to exactly one envelope');
     $errors = $schema->validate($decoded);
     if ($errors !== []) {
         fail(
-            'the gzipped request body does not satisfy event-schema.json:' . PHP_EOL
+            'the gzipped request body does not satisfy envelope.json:' . PHP_EOL
             . '  - ' . implode(PHP_EOL . '  - ', $errors)
         );
     }
 }
 
-// --- the validator has to be able to say no -----------------------------
+// --- 6. the validator has to be able to say no ---------------------------
 
 $valid = wire($overflow);
 expect($schema->validate($valid) === [], 'the baseline envelope should be valid');
@@ -309,28 +794,24 @@ $badEventId = wire($overflow);
 $badEventId->items[0]->event_id = 'not-a-uuid';
 assertRejected($schema, $badEventId, 'a malformed event_id');
 
-$badTimestamp = wire($overflow);
-$badTimestamp->items[0]->timestamp = '2026-09-07 00:00:00';
-assertRejected($schema, $badTimestamp, 'a timestamp that is not RFC 3339');
-
 $negativeDiscarded = wire($overflow);
 $negativeDiscarded->discarded = -1;
 assertRejected($schema, $negativeDiscarded, 'a negative discarded count');
 
 $tooManyItems = wire($overflow);
 $tooManyItems->items[] = clone $tooManyItems->items[0];
-assertRejected($schema, $tooManyItems, 'an envelope with 101 items');
+assertRejected($schema, $tooManyItems, 'an envelope over the item limit');
 
 $noSdk = wire($overflow);
 unset($noSdk->sdk);
 assertRejected($schema, $noSdk, 'an envelope without sdk metadata');
 
-$badFrame = wire($transport->envelopes[0]);
-unset($badFrame->items[5]->exception->values[0]->stacktrace->frames[0]->in_app);
+$badFrame = wire($chained);
+unset($badFrame->items[0]->exception->values[0]->stacktrace->frames[0]->in_app);
 assertRejected($schema, $badFrame, 'a stack frame without in_app');
 
-$badMechanism = wire($transport->envelopes[0]);
-$badMechanism->items[5]->exception->values[0]->mechanism->type = 'servlet';
+$badMechanism = wire($chained);
+$badMechanism->items[0]->exception->values[0]->mechanism->type = 'servlet';
 assertRejected($schema, $badMechanism, 'an unknown mechanism type');
 
 $badTag = wire($overflow);
@@ -346,5 +827,5 @@ expect(
     'unknown item types must stay acceptable for forward compatibility'
 );
 
-$relativeSpec = substr($specDirectory, strlen(dirname(__DIR__)) + 1);
-echo 'MONICA PHP SDK spec contract test passed (' . $relativeSpec . "/event-schema.json)\n";
+echo 'MONICA PHP SDK spec contract test passed (' . count($vectorFiles) . ' vectors, contract revision '
+    . substr($vendored['revision'], 0, 12) . ")\n";

@@ -1,0 +1,55 @@
+{
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/envelope",
+    "content_type": "application/json",
+    "content_encoding": "gzip"
+  },
+  "dsn": {
+    "insecure_hosts": [
+      "localhost",
+      "127.0.0.1"
+    ]
+  },
+  "auth": [
+    {
+      "kind": "secret",
+      "key_prefix": "msk_",
+      "header": "Authorization",
+      "value": "Bearer <key>"
+    },
+    {
+      "kind": "public",
+      "key_prefix": "mpk_",
+      "header": "X-Monica-Key",
+      "value": "<key>"
+    }
+  ],
+  "status": {
+    "202": "accept",
+    "400": "drop",
+    "401": "drop_and_stop",
+    "413": "split_and_retry",
+    "422": "drop",
+    "429": "wait_retry_after",
+    "5xx": "backoff"
+  },
+  "retry": {
+    "retryable_statuses": [
+      "429",
+      "5xx"
+    ],
+    "retry_on_network_error": true,
+    "retry_after": {
+      "integer_seconds_only": true,
+      "max_seconds": 60
+    },
+    "backoff": {
+      "base_ms": 1000,
+      "factor": 2,
+      "max_ms": 30000,
+      "jitter_min": 0.5,
+      "jitter_max": 1
+    }
+  }
+}

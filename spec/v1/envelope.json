@@ -1,0 +1,347 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.monica.accelhack.net/v1/envelope.json",
+  "title": "MONICA envelope",
+  "type": "object",
+  "properties": {
+    "sdk": {
+      "$ref": "#/$defs/sdk"
+    },
+    "sent_at": {
+      "type": "string",
+      "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.\\d+)?(Z|[+-](\\d{2}):(\\d{2}))$"
+    },
+    "discarded": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/errorItem"
+          },
+          {
+            "$ref": "#/$defs/unknownItem"
+          }
+        ]
+      },
+      "maxItems": 100
+    }
+  },
+  "required": [
+    "sdk",
+    "sent_at",
+    "discarded",
+    "items"
+  ],
+  "$defs": {
+    "sdk": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "errorItem": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "event_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        },
+        "timestamp": {
+          "type": "string",
+          "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.\\d+)?(Z|[+-](\\d{2}):(\\d{2}))$"
+        },
+        "level": {
+          "enum": [
+            "fatal",
+            "error",
+            "warning",
+            "info",
+            "debug"
+          ],
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "javascript",
+            "node",
+            "java",
+            "php"
+          ],
+          "type": "string"
+        },
+        "environment": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "release": {
+          "type": "string"
+        },
+        "server_name": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "exception": {
+          "$ref": "#/$defs/exception"
+        },
+        "breadcrumbs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/breadcrumb"
+          }
+        },
+        "request": {
+          "$ref": "#/$defs/request"
+        },
+        "user": {
+          "$ref": "#/$defs/user"
+        },
+        "tags": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "contexts": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        },
+        "fingerprint": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "type",
+        "event_id",
+        "timestamp",
+        "level",
+        "platform",
+        "environment"
+      ]
+    },
+    "unknownItem": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "not": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "error"
+          }
+        }
+      }
+    },
+    "exception": {
+      "type": "object",
+      "properties": {
+        "values": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/exceptionValue"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "values"
+      ]
+    },
+    "exceptionValue": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": "string"
+        },
+        "stacktrace": {
+          "type": "object",
+          "properties": {
+            "frames": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/frame"
+              },
+              "maxItems": 200
+            }
+          },
+          "required": [
+            "frames"
+          ]
+        },
+        "mechanism": {
+          "$ref": "#/$defs/mechanism"
+        }
+      },
+      "required": [
+        "type",
+        "value"
+      ]
+    },
+    "mechanism": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "enum": [
+            "onerror",
+            "onunhandledrejection",
+            "generic"
+          ],
+          "type": "string"
+        },
+        "handled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "type",
+        "handled"
+      ]
+    },
+    "frame": {
+      "type": "object",
+      "properties": {
+        "filename": {
+          "type": "string",
+          "minLength": 1
+        },
+        "function": {
+          "type": "string"
+        },
+        "lineno": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "colno": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "in_app": {
+          "type": "boolean"
+        },
+        "abs_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "filename",
+        "in_app"
+      ]
+    },
+    "breadcrumb": {
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.\\d+)?(Z|[+-](\\d{2}):(\\d{2}))$"
+        },
+        "type": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "level": {
+          "enum": [
+            "fatal",
+            "error",
+            "warning",
+            "info",
+            "debug"
+          ],
+          "type": "string"
+        },
+        "data": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": []
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "headers": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "url",
+        "method"
+      ]
+    },
+    "user": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "ip": {
+          "type": "string"
+        }
+      },
+      "required": []
+    }
+  }
+}

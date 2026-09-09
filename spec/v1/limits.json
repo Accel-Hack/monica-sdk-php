@@ -1,0 +1,6 @@
+{
+  "envelope_gzip_bytes": 1048576,
+  "envelope_decompressed_bytes": 8388608,
+  "items_per_envelope": 100,
+  "frames_per_stacktrace": 200
+}

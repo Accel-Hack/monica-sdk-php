@@ -1,0 +1,13 @@
+{
+  "description": "item が 0 件でも envelope としては正しい",
+  "valid": true,
+  "envelope": {
+    "sdk": {
+      "name": "@ah-monica/core",
+      "version": "1.0.0"
+    },
+    "sent_at": "2026-08-30T00:00:00.000Z",
+    "discarded": 0,
+    "items": []
+  }
+}

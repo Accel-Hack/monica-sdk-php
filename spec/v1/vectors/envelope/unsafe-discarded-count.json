@@ -1,0 +1,24 @@
+{
+  "description": "discarded が安全な整数の範囲を超える",
+  "valid": false,
+  "schema_rejects": false,
+  "envelope": {
+    "sdk": {
+      "name": "@ah-monica/core",
+      "version": "1.0.0"
+    },
+    "sent_at": "2026-08-30T00:00:00.000Z",
+    "discarded": 9007199254740992,
+    "items": [
+      {
+        "type": "error",
+        "event_id": "123e4567-e89b-42d3-a456-426614174000",
+        "timestamp": "2026-08-30T00:00:00.000Z",
+        "level": "error",
+        "platform": "javascript",
+        "environment": "production",
+        "message": "boom"
+      }
+    ]
+  }
+}

@@ -26,7 +26,15 @@
     "bin/monica"
   ],
   "scripts": {
+    "spec:sync": "php scripts/spec-sync.php",
+    "spec:check": "php scripts/spec-sync.php --check",
+    "spec:check-remote": "php scripts/spec-sync.php --check-remote",
     "test": "php tests/run.php && php tests/fatal-runner.php && php tests/spec-contract.php"
+  },
+  "scripts-descriptions": {
+    "spec:sync": "MONICA の公開契約バンドルを spec/ へ取り込み直す",
+    "spec:check": "取り込んだ spec/ が spec.lock.json と一致するか（network 不要）",
+    "spec:check-remote": "配信元の公開契約が動いていないか"
   },
   "support": {
     "issues": "https://github.com/Accel-Hack/monica/issues",
