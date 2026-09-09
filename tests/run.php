@@ -267,6 +267,74 @@ expect(
 );
 $discardSpool($stopDirectory);
 
+// spool_max_files caps the directory, not just the envelopes waiting in it. The
+// flusher retires what it cannot deliver by renaming it aside, and those names
+// do not match *.json: counting only pending envelopes let the directory grow
+// without bound while reporting itself as capped.
+$capDirectory = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'monica-test-' . bin2hex(random_bytes(5));
+$capTransport = new SpoolTransport($capDirectory, 4);
+$countFiles = static function (string $directory): int {
+    $found = 0;
+    foreach (glob($directory . DIRECTORY_SEPARATOR . '{,.}*', GLOB_BRACE) ?: [] as $path) {
+        if (is_file($path)) {
+            $found++;
+        }
+    }
+
+    return $found;
+};
+for ($round = 0; $round < 3; $round++) {
+    for ($index = 0; $index < 4; $index++) {
+        expect($capTransport->send($envelope, 2000), 'the test should spool an envelope');
+    }
+    // Every envelope is refused, so each round turns four pending files into
+    // four retired ones. Before the cap counted them, this grew by four a round.
+    (new SpoolFlusher($capDirectory, new OutcomeTransport(array_fill(0, 4, Outcome::REJECTED)), 60))->flush();
+    expect(
+        $countFiles($capDirectory) <= 4,
+        'round ' . $round . ': the spool directory should stay within spool_max_files, found '
+        . $countFiles($capDirectory)
+    );
+}
+
+// Pending envelopes outlive retired ones: a retired file cannot be delivered
+// any more, so it is the cheaper thing to lose when the cap is reached. The
+// rounds above left the directory full of retired files, so the four written
+// here can only fit if pruning takes the retired ones first.
+expect(
+    count(glob($capDirectory . DIRECTORY_SEPARATOR . '.sending-*.rejected') ?: []) > 0,
+    'the rounds above should have left retired files behind'
+);
+for ($index = 0; $index < 4; $index++) {
+    expect($capTransport->send($envelope, 2000), 'the test should spool an envelope');
+}
+expect(
+    count(glob($capDirectory . DIRECTORY_SEPARATOR . '*.json') ?: []) === 4,
+    'pruning should keep every envelope that can still be sent'
+);
+expect(
+    count(glob($capDirectory . DIRECTORY_SEPARATOR . '.sending-*.rejected') ?: []) === 0,
+    'pruning should drop retired files before pending ones'
+);
+$discardSpool($capDirectory);
+
+// A .tmp file is how an envelope is written before the atomic rename. Pruning
+// must not delete one that another process is still writing, even though its
+// name sorts among the oldest.
+$temporaryDirectory = $spoolWith(4);
+$freshTemporary = $temporaryDirectory . DIRECTORY_SEPARATOR . '.19700101000000-1-fresh.json.tmp';
+expect(file_put_contents($freshTemporary, '{}') !== false, 'the test should create a temporary file');
+$abandonedTemporary = $temporaryDirectory . DIRECTORY_SEPARATOR . '.19700101000001-1-abandoned.json.tmp';
+expect(file_put_contents($abandonedTemporary, '{}') !== false, 'the test should create a temporary file');
+expect(touch($abandonedTemporary, time() - 3600), 'the test should age the abandoned temporary file');
+for ($index = 0; $index < 8; $index++) {
+    expect((new SpoolTransport($temporaryDirectory, 4))->send($envelope, 2000), 'the test should spool');
+}
+expect(is_file($freshTemporary), 'a temporary file still being written must survive pruning');
+expect(!is_file($abandonedTemporary), 'a temporary file left by a dead process should be pruned');
+@unlink($freshTemporary);
+$discardSpool($temporaryDirectory);
+
 // A transport from outside the SDK only answers yes or no, and a no has to keep
 // meaning "try again later".
 $legacyDirectory = $spoolWith(1);

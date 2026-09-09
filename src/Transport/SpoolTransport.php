@@ -8,6 +8,9 @@ use RuntimeException;
 
 final class SpoolTransport implements TransportInterface
 {
+    /** How long a `.tmp` file is assumed to still be in the middle of a write. */
+    private const TEMPORARY_GRACE_SECONDS = 300;
+
     private string $directory;
     private int $maxFiles;
 
@@ -67,13 +70,86 @@ final class SpoolTransport implements TransportInterface
         @chmod($this->directory, 0700);
     }
 
+    /**
+     * Keep the directory within `maxFiles`.
+     *
+     * The flusher retires what it cannot deliver by renaming it aside
+     * (`.rejected`, `.invalid`), and a process that dies between the write and
+     * the rename leaves a `.tmp` behind. None of those match `*.json`, so
+     * counting only pending envelopes would let the directory grow without
+     * bound while reporting itself as capped.
+     *
+     * Envelopes still waiting to be sent are the last thing to go: a retired
+     * file cannot be delivered any more, so it is cheaper to lose.
+     *
+     * Live claims (`.sending-*.json`) are neither counted nor removed. Another
+     * process is mid-request on them, and the flusher recovers them by lease if
+     * that process dies.
+     */
     private function prune(): void
     {
-        $files = glob($this->directory . DIRECTORY_SEPARATOR . '*.json') ?: [];
-        sort($files, SORT_STRING);
-        $remove = count($files) - $this->maxFiles;
-        for ($index = 0; $index < $remove; $index++) {
-            @unlink($files[$index]);
+        $pending = glob($this->directory . DIRECTORY_SEPARATOR . '*.json') ?: [];
+        $retired = array_merge(
+            glob($this->directory . DIRECTORY_SEPARATOR . '.sending-*.json.rejected') ?: [],
+            glob($this->directory . DIRECTORY_SEPARATOR . '.sending-*.json.invalid') ?: [],
+            $this->abandonedTemporaries()
+        );
+        $remove = count($pending) + count($retired) - $this->maxFiles;
+        if ($remove <= 0) {
+            return;
         }
+
+        self::sortByAge($retired);
+        self::sortByAge($pending);
+        foreach (array_merge($retired, $pending) as $file) {
+            if ($remove-- <= 0) {
+                return;
+            }
+            @unlink($file);
+        }
+    }
+
+    /**
+     * `.tmp` files old enough that no one can still be writing them.
+     *
+     * A temporary file is visible for as long as one `file_put_contents` takes,
+     * so anything older than the grace period is the remains of a process that
+     * died mid-write. Without the grace period this would delete a concurrent
+     * writer's file: its name sorts among the oldest here, not the newest.
+     *
+     * @return list<string>
+     */
+    private function abandonedTemporaries(): array
+    {
+        $abandoned = [];
+        $writtenBefore = time() - self::TEMPORARY_GRACE_SECONDS;
+        foreach (glob($this->directory . DIRECTORY_SEPARATOR . '.*.json.tmp') ?: [] as $file) {
+            $modifiedAt = @filemtime($file);
+            if ($modifiedAt !== false && $modifiedAt < $writtenBefore) {
+                $abandoned[] = $file;
+            }
+        }
+
+        return $abandoned;
+    }
+
+    /**
+     * Oldest first. Every name this class and the flusher produce carries the
+     * creation time as the first run of 14 digits, which is what makes files
+     * from the different shapes comparable at all: sorting the paths would
+     * order them by their prefix (`.sending-`, `.`) instead of by age.
+     *
+     * @param list<string> $files
+     */
+    private static function sortByAge(array &$files): void
+    {
+        usort($files, static function (string $a, string $b): int {
+            return [self::createdAt($a), $a] <=> [self::createdAt($b), $b];
+        });
+    }
+
+    private static function createdAt(string $path): string
+    {
+        return preg_match('/(\d{14})/', basename($path), $matches) === 1 ? $matches[1] : '';
     }
 }
