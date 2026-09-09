@@ -37,6 +37,7 @@ use Monica\Client;
 use Monica\EventFactory;
 use Monica\Tests\Spec\JsonSchema;
 use Monica\Transport\Dsn;
+use Monica\Transport\Outcome;
 use Monica\Transport\TransportInterface;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Http\Client\ClientInterface;
@@ -629,16 +630,18 @@ expect(
     'transport.json should describe both a secret and a public key scheme'
 );
 
-// This SDK implements only part of transport.json: the endpoint and the secret
-// key scheme. The status table and the retry policy have no consumer yet -- the
-// transports return a bool and never retry. Pinning the vocabulary here turns
+// This SDK implements part of transport.json. `status` has a consumer now --
+// Outcome classifies a response and the spool flusher acts on it -- but not
+// every cell of the table (see the mapping below), and `retry` still has none:
+// nothing reads `Retry-After` or backs off. Pinning the vocabulary here turns
 // "MONICA grew an obligation the PHP SDK ignores" into a failing test instead of
 // a silent gap.
 $implemented = ['endpoint', 'dsn', 'auth'];
-$unimplemented = ['status', 'retry'];
+$partiallyImplemented = ['status'];
+$unimplemented = ['retry'];
 $declared = array_keys($transportSpec);
 sort($declared, SORT_STRING);
-$accounted = array_merge($implemented, $unimplemented);
+$accounted = array_merge($implemented, $partiallyImplemented, $unimplemented);
 sort($accounted, SORT_STRING);
 expect(
     $declared === $accounted,
@@ -658,7 +661,49 @@ expect(
 );
 expect(
     $transportSpec['status']['202'] === 'accept',
-    'a 202 must still mean the envelope left the queue, which is all this SDK acts on'
+    'a 202 must still mean the envelope left the queue'
+);
+
+// How each behaviour in the status table reaches this SDK. Outcome is the only
+// place a status is interpreted, so this is the whole of the SDK's conformance
+// to the table -- including where it knowingly diverges.
+$sdkHandling = [
+    'accept' => Outcome::ACCEPTED,
+    'drop' => Outcome::REJECTED,
+    'drop_and_stop' => Outcome::REJECTED_STOP,
+    // The retry *timing* is unimplemented, so both retry behaviours collapse
+    // into "try this envelope again on the next run" without honouring
+    // Retry-After or backing off.
+    'wait_retry_after' => Outcome::RETRYABLE,
+    'backoff' => Outcome::RETRYABLE,
+    // A deliberate divergence: splitting on the byte limits is unimplemented,
+    // so a 413 cannot be retried into anything but another 413. It is dropped
+    // rather than kept forever. When the split lands, this line changes with it.
+    'split_and_retry' => Outcome::REJECTED,
+];
+foreach ($transportSpec['status'] as $status => $behaviour) {
+    expect(
+        isset($sdkHandling[$behaviour]),
+        'transport.json asks for a behaviour this SDK does not classify: ' . $behaviour
+    );
+    // A key like "5xx" stands for a range, so members of it are what can be
+    // classified. json_decode(..., true) has already turned "202" into an int.
+    $codes = substr((string) $status, -1) === 'x'
+        ? [(int) (substr((string) $status, 0, 1) . '00'), (int) (substr((string) $status, 0, 1) . '03')]
+        : [(int) $status];
+    foreach ($codes as $code) {
+        expect(
+            Outcome::forStatus($code) === $sdkHandling[$behaviour],
+            'HTTP ' . $code . ' should be handled as ' . $behaviour
+            . ', not ' . Outcome::forStatus($code)
+        );
+    }
+}
+// transport.json says network failures are retryable, and there is no status to
+// hang that on: the transports report it directly.
+expect(
+    $transportSpec['retry']['retry_on_network_error'] === true,
+    'transport.json should still ask for network failures to be retried'
 );
 
 // The DSN path is not the ingest path. Sending to the DSN's trailing digits
@@ -667,6 +712,20 @@ $parsed = Dsn::parse('https://msk_secret@ingest.example.test/1?q=1#f');
 expect(
     $parsed['endpoint'] === 'https://ingest.example.test' . $endpoint['path'],
     'the DSN path, query and fragment must be dropped in favour of ' . $endpoint['path']
+);
+
+// A public key is for SDKs that ship inside a client. Sent as a Bearer token by
+// a server SDK it is a guaranteed 401, so the DSN is refused up front instead of
+// losing every event to a status nobody sees.
+$publicKeyRejected = false;
+try {
+    Dsn::parse('https://' . $authSchemes['public']['key_prefix'] . 'contract@ingest.example.test/1');
+} catch (InvalidArgumentException $rejected) {
+    $publicKeyRejected = true;
+}
+expect(
+    $publicKeyRejected,
+    'a DSN carrying a ' . $authSchemes['public']['key_prefix'] . ' key must be rejected'
 );
 
 // https everywhere, except the hosts transport.json names.

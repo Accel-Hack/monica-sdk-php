@@ -41,6 +41,16 @@ SDKはrequest body、Cookie、Authorization、SQL引数を自動収集しませ�
 - `spool`: `spool_dir`へ権限0600のJSONをatomicに保存します。CLI/batch向けです。
   flush中にprocessが停止して残ったclaimは、既定5分のlease満了後に次のflushが回収します。
 
+MONICA が恒久的に拒否した envelope（`400` / `422` / `413`）は spool に残さず、
+`.rejected` を付けて脇に退けます。残すと後続の envelope が、決して成功しない
+requestを待って出られなくなるためです。`429` / `5xx` とネットワーク障害はspoolに
+残り、次のflushで送り直します。`401`はその1通を退けてflushを打ち切ります。
+`spool:flush` の出力の `rejected` がこれで、0 でなければ exit code は 1 です。
+
+DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
+送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
+`401`になり、eventが黙って消えるだけだからです。
+
 ```sh
 vendor/bin/monica test
 vendor/bin/monica spool:flush --spool-dir=/var/spool/monica
@@ -121,17 +131,23 @@ PHP だけ気付けない状態を作らないためです。schema を通るこ
 
 ### まだ実装していない契約
 
-`transport.json` のうち、この SDK が実装しているのは `endpoint` / `dsn` / `auth`
-だけです。`status`（status ごとの挙動）と `retry`（`Retry-After`、backoff）には
-まだ consumer がなく、transport は bool を返すだけでリトライしません。
-`error.json` の body も読んでいません。
+`transport.json` のうち実装しているのは `endpoint` / `dsn` / `auth` と、
+`status`（status ごとの挙動）の一部です。`status` は `Monica\Transport\Outcome`
+が「受理 / 恒久失敗 / 再送可」の3つに分類し、spool の flusher がそれに従います。
+残っているのは次の2つです。
 
-黙って取り残されないように、契約テストは `transport.json` の section 名と status
-の語彙を固定しています。MONICA 側が section や status を増やすと、
-「この SDK が考慮していない契約が増えた」として落ちます。
+- `retry`（`Retry-After`、backoff）には consumer がありません。再送は「次の flush で
+  もう一度送る」だけで、待ち時間もjitterも回数上限もありません。shutdown transport は
+  そもそも再送しないので、`429` / `5xx` の間の event は落ちます
+- `413` の `split_and_retry`。envelope の byte 上限（gzip 1 MiB / 展開後 8 MiB）での
+  分割が未実装なので、同じ byte を送り直しても `413` のままです。いまは恒久失敗として
+  扱っています。item 数 100 での分割はあります
 
-あわせて、envelope の byte 上限（gzip 1 MiB / 展開後 8 MiB）での分割も未実装です。
-item 数 100 での分割はあります。
+`error.json` の body も読んでいません（`422` の `issues` が見えません）。
+
+黙って取り残されないように、契約テストは `transport.json` の section 名と status の
+語彙、それに status ごとの分類そのものを固定しています。MONICA 側が section や status
+を増やすと、「この SDK が考慮していない契約が増えた」として落ちます。
 
 ## Release
 

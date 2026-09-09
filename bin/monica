@@ -61,13 +61,18 @@ if ($command === 'spool:flush') {
     fwrite(
         STDOUT,
         sprintf(
-            "MONICA spool: sent=%d failed=%d invalid=%d\n",
+            "MONICA spool: sent=%d failed=%d rejected=%d invalid=%d\n",
             $result['sent'],
             $result['failed'],
+            $result['rejected'],
             $result['invalid']
         )
     );
-    exit($result['failed'] > 0 || $result['invalid'] > 0 ? 1 : 0);
+    exit(
+        $result['failed'] > 0 || $result['rejected'] > 0 || $result['invalid'] > 0
+            ? 1
+            : 0
+    );
 }
 
 fwrite(STDOUT, "Usage:\n");

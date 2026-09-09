@@ -5,6 +5,8 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use Monica\Client;
+use Monica\Transport\Outcome;
+use Monica\Transport\OutcomeAwareInterface;
 use Monica\Transport\SpoolFlusher;
 use Monica\Transport\SpoolTransport;
 use Monica\Transport\TransportInterface;
@@ -33,6 +35,37 @@ final class RecordingTransport implements TransportInterface
     }
 }
 
+/**
+ * A transport that answers with the outcome of each call in turn, so the spool
+ * flusher can be driven through every branch of transport.json's status table.
+ */
+final class OutcomeTransport implements TransportInterface, OutcomeAwareInterface
+{
+    /** @var list<array<string, mixed>> */
+    public array $envelopes = [];
+    /** @var list<string> */
+    private array $outcomes;
+
+    /** @param list<string> $outcomes */
+    public function __construct(array $outcomes)
+    {
+        $this->outcomes = $outcomes;
+    }
+
+    public function send(array $envelope, int $timeoutMilliseconds): bool
+    {
+        return $this->sendEnvelope($envelope, $timeoutMilliseconds) === Outcome::ACCEPTED;
+    }
+
+    public function sendEnvelope(array $envelope, int $timeoutMilliseconds): string
+    {
+        $this->envelopes[] = $envelope;
+        $outcome = array_shift($this->outcomes);
+
+        return $outcome === null ? Outcome::ACCEPTED : $outcome;
+    }
+}
+
 function expect(bool $condition, string $message): void
 {
     if (!$condition) {
@@ -47,6 +80,14 @@ try {
     $invalidDsnRejected = true;
 }
 expect($invalidDsnRejected, 'DSNs should allow only HTTPS or local HTTP');
+
+$publicKeyRejected = false;
+try {
+    Dsn::parse('https://mpk_public@ingest.example.test/1');
+} catch (InvalidArgumentException $ignored) {
+    $publicKeyRejected = true;
+}
+expect($publicKeyRejected, 'a public key DSN should be rejected instead of 401ing at runtime');
 
 $transport = new RecordingTransport();
 $client = new Client([
@@ -149,10 +190,95 @@ expect(rename($spooledFiles[0], $staleClaim), 'the test should simulate a claime
 expect(touch($staleClaim, time() - 120), 'the test should make the claim stale');
 $receiver = new RecordingTransport();
 $result = (new SpoolFlusher($spoolDirectory, $receiver, 60))->flush();
-expect($result === ['sent' => 1, 'failed' => 0, 'invalid' => 0], 'spool should flush');
+expect(
+    $result === ['sent' => 1, 'failed' => 0, 'rejected' => 0, 'invalid' => 0],
+    'spool should flush'
+);
 expect(count($receiver->envelopes) === 1, 'a stale spool claim should be recovered and sent');
 expect(count(glob($spoolDirectory . '/*.json') ?: []) === 0, 'sent spool file should be removed');
 @rmdir($spoolDirectory);
+
+$spoolWith = static function (int $count) use ($envelope): string {
+    $directory = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'monica-test-' . bin2hex(random_bytes(5));
+    $transport = new SpoolTransport($directory, 10);
+    for ($index = 0; $index < $count; $index++) {
+        expect($transport->send($envelope, 2000), 'the test should spool an envelope');
+    }
+
+    return $directory;
+};
+$discardSpool = static function (string $directory): void {
+    foreach (glob($directory . DIRECTORY_SEPARATOR . '{,.}*', GLOB_BRACE) ?: [] as $path) {
+        if (is_file($path)) {
+            @unlink($path);
+        }
+    }
+    @rmdir($directory);
+};
+
+// A permanent rejection must not hold up the envelopes behind it. Keeping a
+// doomed envelope in the spool used to stall every later one until the spool
+// filled up and pruned it.
+$rejectDirectory = $spoolWith(2);
+$rejecting = new OutcomeTransport([Outcome::REJECTED]);
+$rejectResult = (new SpoolFlusher($rejectDirectory, $rejecting, 60))->flush();
+expect(
+    $rejectResult === ['sent' => 1, 'failed' => 0, 'rejected' => 1, 'invalid' => 0],
+    'a rejected envelope should be counted and the run should continue: '
+    . json_encode($rejectResult)
+);
+expect(count($rejecting->envelopes) === 2, 'the envelope behind a rejected one should still be sent');
+expect(count(glob($rejectDirectory . '/*.json') ?: []) === 0, 'neither envelope should stay in the spool');
+expect(
+    count(glob($rejectDirectory . '/.sending-*.rejected') ?: []) === 1,
+    'a rejected envelope should be kept aside rather than deleted'
+);
+$discardSpool($rejectDirectory);
+
+// 429, 5xx and network failures are the opposite case: the envelope stays put
+// and the run stops, because whatever failed applies to the rest of it too.
+$retryDirectory = $spoolWith(2);
+$retrying = new OutcomeTransport([Outcome::RETRYABLE]);
+$retryResult = (new SpoolFlusher($retryDirectory, $retrying, 60))->flush();
+expect(
+    $retryResult === ['sent' => 0, 'failed' => 1, 'rejected' => 0, 'invalid' => 0],
+    'a retryable failure should be counted as failed: ' . json_encode($retryResult)
+);
+expect(count($retrying->envelopes) === 1, 'a retryable failure should stop the run');
+expect(
+    count(glob($retryDirectory . '/*.json') ?: []) === 2,
+    'a retryable envelope should stay in the spool for the next run'
+);
+$discardSpool($retryDirectory);
+
+// A refused key drops the envelope in hand and stops the run, but leaves the
+// rest of the spool alone: the key may be fixed before the next one.
+$stopDirectory = $spoolWith(2);
+$stopping = new OutcomeTransport([Outcome::REJECTED_STOP]);
+$stopResult = (new SpoolFlusher($stopDirectory, $stopping, 60))->flush();
+expect(
+    $stopResult === ['sent' => 0, 'failed' => 0, 'rejected' => 1, 'invalid' => 0],
+    'a refused key should be counted as rejected: ' . json_encode($stopResult)
+);
+expect(count($stopping->envelopes) === 1, 'a refused key should stop the run');
+expect(
+    count(glob($stopDirectory . '/*.json') ?: []) === 1,
+    'the envelope behind a refused key should stay in the spool'
+);
+$discardSpool($stopDirectory);
+
+// A transport from outside the SDK only answers yes or no, and a no has to keep
+// meaning "try again later".
+$legacyDirectory = $spoolWith(1);
+$legacyReceiver = new RecordingTransport();
+$legacyReceiver->accepted = false;
+$legacyResult = (new SpoolFlusher($legacyDirectory, $legacyReceiver, 60))->flush();
+expect(
+    $legacyResult === ['sent' => 0, 'failed' => 1, 'rejected' => 0, 'invalid' => 0],
+    'a bool-only transport saying no should still mean retryable: ' . json_encode($legacyResult)
+);
+expect(count(glob($legacyDirectory . '/*.json') ?: []) === 1, 'the envelope should stay in the spool');
+$discardSpool($legacyDirectory);
 
 if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class)) {
     $factory = new Psr17Factory();
