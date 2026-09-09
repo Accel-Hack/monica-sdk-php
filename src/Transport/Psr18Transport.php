@@ -10,7 +10,7 @@ use Psr\Http\Message\StreamFactoryInterface;
 use RuntimeException;
 use Throwable;
 
-final class Psr18Transport implements TransportInterface
+final class Psr18Transport implements TransportInterface, OutcomeAwareInterface
 {
     private ClientInterface $client;
     private RequestFactoryInterface $requestFactory;
@@ -32,6 +32,11 @@ final class Psr18Transport implements TransportInterface
 
     public function send(array $envelope, int $timeoutMilliseconds): bool
     {
+        return $this->sendEnvelope($envelope, $timeoutMilliseconds) === Outcome::ACCEPTED;
+    }
+
+    public function sendEnvelope(array $envelope, int $timeoutMilliseconds): string
+    {
         unset($timeoutMilliseconds);
 
         try {
@@ -50,13 +55,13 @@ final class Psr18Transport implements TransportInterface
                 ->withHeader('Content-Encoding', 'gzip')
                 ->withBody($this->streamFactory->createStream($body));
             $response = $this->client->sendRequest($request);
-            $status = $response->getStatusCode();
 
-            return $status >= 200 && $status < 300;
+            return Outcome::forStatus($response->getStatusCode());
         } catch (Throwable $ignored) {
             // Transport failures never escape into application handlers. Apart
             // from protecting the host, this prevents recursive MONICA events.
-            return false;
+            // A PSR-18 client throws on a network failure, which is retryable.
+            return Outcome::RETRYABLE;
         }
     }
 }

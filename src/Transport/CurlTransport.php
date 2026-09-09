@@ -7,7 +7,7 @@ namespace Monica\Transport;
 use RuntimeException;
 use Throwable;
 
-final class CurlTransport implements TransportInterface
+final class CurlTransport implements TransportInterface, OutcomeAwareInterface
 {
     /** @var array{endpoint: string, key: string} */
     private array $dsn;
@@ -18,6 +18,11 @@ final class CurlTransport implements TransportInterface
     }
 
     public function send(array $envelope, int $timeoutMilliseconds): bool
+    {
+        return $this->sendEnvelope($envelope, $timeoutMilliseconds) === Outcome::ACCEPTED;
+    }
+
+    public function sendEnvelope(array $envelope, int $timeoutMilliseconds): string
     {
         if (!function_exists('curl_init')) {
             throw new RuntimeException('The cURL extension is required when no PSR-18 client is supplied');
@@ -51,13 +56,13 @@ final class CurlTransport implements TransportInterface
             ]);
             $result = curl_exec($handle);
             if ($result === false) {
-                return false;
+                // A network failure, which transport.json says to retry.
+                return Outcome::RETRYABLE;
             }
-            $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
 
-            return $status >= 200 && $status < 300;
+            return Outcome::forStatus((int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE));
         } catch (Throwable $ignored) {
-            return false;
+            return Outcome::RETRYABLE;
         } finally {
             curl_close($handle);
         }

@@ -1,0 +1,107 @@
+{
+  "description": "cause チェーン、frame、breadcrumb、request、user、tags、contexts、fingerprint と、未知の拡張フィールド",
+  "valid": true,
+  "envelope": {
+    "sdk": {
+      "name": "@ah-monica/core",
+      "version": "1.0.0"
+    },
+    "sent_at": "2026-08-30T00:00:00.000Z",
+    "discarded": 0,
+    "items": [
+      {
+        "type": "error",
+        "event_id": "123e4567-e89b-42d3-a456-426614174000",
+        "timestamp": "2026-08-30T00:00:00.000Z",
+        "level": "error",
+        "platform": "javascript",
+        "environment": "production",
+        "message": "boom",
+        "release": "2026.08.30+1",
+        "server_name": "api-1",
+        "exception": {
+          "values": [
+            {
+              "type": "java.lang.IllegalStateException",
+              "value": "outer",
+              "mechanism": {
+                "type": "generic",
+                "handled": false
+              },
+              "stacktrace": {
+                "frames": [
+                  {
+                    "filename": "com/example/app/Main.java",
+                    "function": "com.example.app.Main.main",
+                    "lineno": 42,
+                    "in_app": true
+                  }
+                ]
+              }
+            },
+            {
+              "type": "java.io.IOException",
+              "value": "inner",
+              "stacktrace": {
+                "frames": [
+                  {
+                    "filename": "vendor/example/lib/Client.php",
+                    "in_app": false
+                  },
+                  {
+                    "filename": "com/example/app/service/OrderService.java",
+                    "function": "com.example.app.service.OrderService.lambda$refresh$0",
+                    "lineno": 17,
+                    "in_app": true
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "breadcrumbs": [
+          {
+            "timestamp": "2026-08-29T23:59:59.000Z",
+            "type": "http",
+            "category": "fetch",
+            "message": "GET /orders",
+            "level": "info",
+            "data": {
+              "status": 500
+            }
+          }
+        ],
+        "request": {
+          "url": "https://app.example.test/orders",
+          "method": "POST",
+          "headers": {
+            "content-type": "application/json"
+          }
+        },
+        "user": {
+          "id": "u_1",
+          "email": "user@example.test",
+          "ip": "192.0.2.1"
+        },
+        "tags": {
+          "component": "api",
+          "release_channel": "stable"
+        },
+        "contexts": {
+          "runtime": {
+            "name": "node",
+            "version": "22.0.0"
+          }
+        },
+        "fingerprint": [
+          "checkout",
+          "timeout"
+        ],
+        "future_item_field": {
+          "retained": true
+        }
+      }
+    ],
+    "future_envelope_field": true
+  }
+}

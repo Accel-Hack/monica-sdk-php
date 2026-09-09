@@ -1,0 +1,23 @@
+{
+  "description": "UTC 以外の RFC 3339 offset",
+  "valid": true,
+  "envelope": {
+    "sdk": {
+      "name": "@ah-monica/core",
+      "version": "1.0.0"
+    },
+    "sent_at": "2026-08-30T09:00:00+09:00",
+    "discarded": 0,
+    "items": [
+      {
+        "type": "error",
+        "event_id": "123e4567-e89b-42d3-a456-426614174000",
+        "timestamp": "2026-08-30T09:00:00+09:00",
+        "level": "error",
+        "platform": "javascript",
+        "environment": "production",
+        "message": "boom"
+      }
+    ]
+  }
+}

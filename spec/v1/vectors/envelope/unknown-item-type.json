@@ -1,0 +1,19 @@
+{
+  "description": "新しい SDK が古い backend へ送っても壊れない。未知の type は受理される",
+  "valid": true,
+  "envelope": {
+    "sdk": {
+      "name": "@ah-monica/core",
+      "version": "1.0.0"
+    },
+    "sent_at": "2026-08-30T00:00:00.000Z",
+    "discarded": 0,
+    "items": [
+      {
+        "type": "metric",
+        "name": "queue.depth",
+        "value": 3
+      }
+    ]
+  }
+}

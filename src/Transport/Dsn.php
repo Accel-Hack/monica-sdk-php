@@ -34,9 +34,21 @@ final class Dsn
             $authority .= ':' . (int) $parts['port'];
         }
 
+        $key = rawurldecode((string) $parts['user']);
+        // A public key authenticates with X-Monica-Key, a header no server SDK
+        // sends. As a Bearer token it is a guaranteed 401, and the events would
+        // disappear with nothing to look at, so the DSN is refused where it is
+        // configured instead of once per request at runtime.
+        if (strncasecmp($key, 'mpk_', 4) === 0) {
+            throw new InvalidArgumentException(
+                'dsn carries a public key (mpk_), which only browser and mobile SDKs may use. '
+                . 'The PHP SDK needs a secret key (msk_)'
+            );
+        }
+
         return [
             'endpoint' => $scheme . '://' . $authority . '/v1/envelope',
-            'key' => rawurldecode((string) $parts['user']),
+            'key' => $key,
         ];
     }
 }

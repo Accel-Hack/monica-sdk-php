@@ -26,11 +26,11 @@ final class SpoolFlusher
     }
 
     /**
-     * @return array{sent: int, failed: int, invalid: int}
+     * @return array{sent: int, failed: int, rejected: int, invalid: int}
      */
     public function flush(int $timeoutMilliseconds = 2000): array
     {
-        $result = ['sent' => 0, 'failed' => 0, 'invalid' => 0];
+        $result = ['sent' => 0, 'failed' => 0, 'rejected' => 0, 'invalid' => 0];
         $this->recoverStaleClaims();
         $files = glob($this->directory . DIRECTORY_SEPARATOR . '*.json') ?: [];
         sort($files, SORT_STRING);
@@ -53,22 +53,56 @@ final class SpoolFlusher
                     @rename($claimed, $claimed . '.invalid');
                     continue;
                 }
-                if ($this->transport->send($envelope, $timeoutMilliseconds)) {
-                    $result['sent']++;
-                    @unlink($claimed);
-                    continue;
-                }
-                $result['failed']++;
-                @rename($claimed, $file);
-                break;
+                $outcome = $this->outcomeOf($envelope, $timeoutMilliseconds);
             } catch (Throwable $ignored) {
                 $result['failed']++;
                 @rename($claimed, $file);
                 break;
             }
+
+            if ($outcome === Outcome::ACCEPTED) {
+                $result['sent']++;
+                @unlink($claimed);
+                continue;
+            }
+            if ($outcome === Outcome::RETRYABLE) {
+                // The same bytes may be accepted later, so the envelope goes
+                // back to the spool. Whatever made this fail -- the network,
+                // rate limiting, MONICA being down -- applies to the rest of
+                // the run too, so there is nothing to gain from continuing.
+                $result['failed']++;
+                @rename($claimed, $file);
+                break;
+            }
+
+            // A permanent rejection. Leaving it in the spool would make every
+            // envelope behind it wait for a request that can never succeed, so
+            // it moves aside like an unparseable file does.
+            $result['rejected']++;
+            @rename($claimed, $claimed . '.rejected');
+            if ($outcome === Outcome::REJECTED_STOP) {
+                // The key itself is refused, so the rest of the run would be.
+                break;
+            }
         }
 
         return $result;
+    }
+
+    /**
+     * @param array<string, mixed> $envelope
+     */
+    private function outcomeOf(array $envelope, int $timeoutMilliseconds): string
+    {
+        if ($this->transport instanceof OutcomeAwareInterface) {
+            return $this->transport->sendEnvelope($envelope, $timeoutMilliseconds);
+        }
+
+        // A transport supplied from outside only answers yes or no. Treating a
+        // no as retryable keeps the behaviour it had before outcomes existed.
+        return $this->transport->send($envelope, $timeoutMilliseconds)
+            ? Outcome::ACCEPTED
+            : Outcome::RETRYABLE;
     }
 
     private function recoverStaleClaims(): void

@@ -1,0 +1,13 @@
+# Packagist が配るのは git archive なので、ここに書いたものは配布物に入らない。
+#
+# spec/ は Accel-Hack/monica が公開している契約バンドルのコピーで、この package
+# の所有物ではない。契約テストにしか要らないので配らない。tests/ を配ると、
+# 利用者の手元には spec/ が無いまま契約テストだけが届いて `composer test` が
+# 落ちるので、開発用のものはまとめて外す。
+/spec export-ignore
+/spec.lock.json export-ignore
+/scripts export-ignore
+/tests export-ignore
+/.github export-ignore
+/.gitattributes export-ignore
+/.gitignore export-ignore
