@@ -41,6 +41,12 @@ SDKはrequest body、Cookie、Authorization、SQL引数を自動収集しませ�
 - `spool`: `spool_dir`へ権限0600のJSONをatomicに保存します。CLI/batch向けです。
   flush中にprocessが停止して残ったclaimは、既定5分のlease満了後に次のflushが回収します。
 
+Apache + mod_php（`apache2handler`）では`shutdown`の送信がレスポンスをブロックします。
+レスポンスを返し切ってから送るために使う`fastcgi_finish_request()`がFPM / FastCGI
+SAPIにしか無く、mod_phpにはコネクションを切り離す手段がないためです。MONICAが
+応答しないとクライアントの待ち時間が`request_timeout_ms`（既定2000ms）の分だけ
+伸びるので、**この構成では`spool`を使ってください**。CLI/batchと同じ理由です。
+
 MONICA が恒久的に拒否した envelope（`400` / `422` / `413`）は spool に残さず、
 `.rejected` を付けて脇に退けます。残すと後続の envelope が、決して成功しない
 requestを待って出られなくなるためです。`429` / `5xx` とネットワーク障害はspoolに
