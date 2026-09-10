@@ -120,42 +120,26 @@ byte 上限は `Monica\Transport\EnvelopeSplitter::MAX_GZIP_BYTES` /
 
 ## 再送（retry）
 
-`transport.json` の `retry` に従います。再送するのは `429` / `5xx` と
-ネットワーク障害だけで、他の 4xx は恒久的な失敗です。
+再送するのは `429` / `5xx` とネットワーク障害だけで、他の 4xx は恒久的な失敗です。
 
-**待ち時間は `sleep()` で消費しません。** PHP で送信に失敗する process は、
-たいてい利用者を待たせている request です。代わりに「この時刻まで送らない」を
-**spool のファイル名に書いて**次の flush に任せます。process をまたいで数える
-必要があるので、attempt 回数も同じ場所に持ちます。
-
-```text
-20260910120000-31337-9f2c1a--try2-at1757500000.json
-                            ^^^^^^ 2回試した  ^^^^^^^^^^ この unix 時刻まで送らない
-```
-
-作成時刻（先頭14桁）はそのままなので、spool の並び順と prune は変わりません。
-中身は envelope そのままで、SDK の都合を混ぜません（MONICA へそのまま送るため）。
-
-- `429` は `Retry-After` の秒数だけ待ちます。整数秒だけ解釈し、HTTP-date は
-  解釈せずbackoffに落とします（自分の時計をサーバの時計と突き合わせないため）。
-  上限は60秒で、超える値は丸めます
-- それ以外は `min(1000 * 2^(attempt-1), 30000)` ms に 50〜100% の jitter です。
-  同時に落ちた複数 processが揃って戻ってこないようにするためです
+- `429` は `Retry-After` の秒数だけ待ちます。整数秒だけを解釈し（HTTP-date は
+  backoffに落とします）、上限は60秒で、超える値は丸めます
+- それ以外は `min(1000 * 2^(attempt-1), 30000)` ms に 50〜100% の jitter です
 - attempt が上限（既定5回、`SpoolFlusher` の第4引数 `RetryPolicy` で変更可）に
-  達したら envelope を捨てます。上限が無いと、恒久的に失敗する envelope が
-  spool を占め続けます。捨てるときは警告を出します
+  達したら envelope を捨て、警告を出します
 
 ```text
 monica: giving up on a spooled envelope after 5 attempt(s); 3 event(s) are lost
 ```
 
-待ち時間中の envelope は `spool:flush` の出力の `deferred` に出ます。
-`sent=0 failed=0 deferred=3` は「MONICA が応答しない」ではなく「まだ時刻では
-ない」という意味で、exit code は 0 です。
+待ち時間は `sleep()` で消費せず、attempt 回数と「この時刻まで送らない」を spool の
+ファイル名（`…--try2-at1757500000.json`）に持ちます。待ち時間中の envelope は
+`spool:flush` の出力の `deferred` に出ます。`sent=0 failed=0 deferred=3` は「MONICA が
+応答しない」ではなく「まだ時刻ではない」という意味で、exit code は 0 です。
 
 **待ち時間は次の flush が拾うので、`spool:flush` は定期実行してください。**
 1回しか実行しない運用だと、待ち時間に入った envelope はそのrunでは送られません。
-間隔は backoff の最小値（1秒）より長ければよく、1分程度が扱いやすいです。
+間隔は 1 分程度が扱いやすいです。同時に複数走っても問題ありません。
 
 ```cron
 * * * * * /usr/bin/php /srv/app/vendor/bin/monica spool:flush >> /var/log/monica-spool.log 2>&1
@@ -177,15 +161,13 @@ OnUnitActiveSec=1min
 AccuracySec=1s
 ```
 
-同時に複数走っても問題ありません（`.sending-` の claim で1通を1processが持ちます）。
 警告（`422` の issues、`401`、諦めた envelope）は STDERR に出るので、上の例のように
 ログへ落としてください。
 
-**直接送信（`shutdown`）は再送しません。** request の中で待つと、その時間は
-利用者の待ち時間になります（mod_php ではレスポンスがブロックされます）。
-`flush()` が false を返した event は queue に残り、同じ process の中で次に
-`flush()` が呼ばれたときに送り直すだけです。process が終われば失われます。
-**`429` / `5xx` の間の event を落としたくない場合は `spool` を使ってください。**
+**直接送信（`shutdown`）は再送しません。** `flush()` が false を返した event は queue に
+残り、同じ process の中で次に `flush()` が呼ばれたときに送り直すだけで、process が
+終われば失われます。**`429` / `5xx` の間の event を落としたくない場合は `spool` を
+使ってください。**
 
 DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
 送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
