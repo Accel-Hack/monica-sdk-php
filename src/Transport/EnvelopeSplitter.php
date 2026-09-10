@@ -64,12 +64,16 @@ final class EnvelopeSplitter
      */
     public function send(array $envelope, callable $post): Response
     {
-        $pending = [$envelope];
-        $dropped = 0;
+        // Each piece remembers where its items sat in the envelope it came
+        // from, so a dropped item can be named to the caller and not merely
+        // counted: the caller has a queue to take it out of.
+        $pending = [['envelope' => $envelope, 'offset' => 0]];
+        $droppedIndexes = [];
         $last = null;
 
         while ($pending !== []) {
-            $piece = array_shift($pending);
+            $work = array_shift($pending);
+            $piece = $work['envelope'];
             $encoded = self::encode($piece);
             $tooBig = strlen($encoded['gzip']) > self::MAX_GZIP_BYTES
                 || strlen($encoded['json']) > self::MAX_DECOMPRESSED_BYTES;
@@ -79,8 +83,10 @@ final class EnvelopeSplitter
                 if ($response->status() !== 413) {
                     if ($response->outcome() !== Outcome::ACCEPTED) {
                         // Whatever this was -- refused key, rate limit, network
-                        // -- applies to the pieces behind it too.
-                        return $dropped > 0 ? $response->withDroppedItems($dropped) : $response;
+                        // -- applies to the pieces behind it too. What was
+                        // already dropped still goes back with it: the caller
+                        // is about to retry the rest, and must not retry these.
+                        return self::withDropped($response, $droppedIndexes);
                     }
                     $last = $response;
                     continue;
@@ -91,16 +97,37 @@ final class EnvelopeSplitter
 
             $halves = self::halve($piece);
             if ($halves === null) {
-                $dropped += max(1, count(self::itemsOf($piece)));
+                // Whatever is in this piece cannot be sent. Usually that is one
+                // item; an envelope whose own fields do not fit has none, and
+                // then nothing is lost and nothing is counted.
+                $count = count(self::itemsOf($piece));
+                for ($index = 0; $index < $count; $index++) {
+                    $droppedIndexes[] = $work['offset'] + $index;
+                }
                 $this->diagnostics->warn(self::describeDrop($piece, $encoded['gzip'], $tooBig));
                 continue;
             }
-            array_unshift($pending, $halves[0], $halves[1]);
+            array_unshift(
+                $pending,
+                ['envelope' => $halves[0], 'offset' => $work['offset']],
+                [
+                    'envelope' => $halves[1],
+                    'offset' => $work['offset'] + count(self::itemsOf($halves[0])),
+                ]
+            );
         }
 
-        $result = $last ?? Response::forOutcome(Outcome::ACCEPTED);
+        return self::withDropped($last ?? Response::forOutcome(Outcome::ACCEPTED), $droppedIndexes);
+    }
 
-        return $dropped > 0 ? $result->withDroppedItems($dropped) : $result;
+    /**
+     * @param list<int> $droppedIndexes
+     */
+    private static function withDropped(Response $response, array $droppedIndexes): Response
+    {
+        return $droppedIndexes === []
+            ? $response
+            : $response->withDroppedItems(count($droppedIndexes), $droppedIndexes);
     }
 
     /**
@@ -166,7 +193,7 @@ final class EnvelopeSplitter
     {
         $items = self::itemsOf($envelope);
 
-        return 'monica: dropped ' . max(1, count($items)) . ' item(s) that cannot fit one envelope ('
+        return 'monica: dropped ' . count($items) . ' item(s) that cannot fit one envelope ('
             . strlen($gzip) . ' gzip bytes, limit ' . self::MAX_GZIP_BYTES . ', '
             . ($measured ? 'measured by the SDK' : 'ingest answered 413')
             . '); the event(s) are lost';

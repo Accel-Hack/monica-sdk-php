@@ -1104,6 +1104,74 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
         'the SDK should say it refused the item itself: ' . json_encode($selfDropWarnings)
     );
 
+    // A drop and a failure in the same flush. The oversized item is gone
+    // whatever happens to the rest, so it must not stay in the queue: retrying
+    // it would drop it again, and warn again, on every flush.
+    $splitClient->envelopes = [];
+    $splitClient->maxItems = null;
+    $splitClient->status = 500;
+    $mixedWarnings = [];
+    $mixedClient = new Client([
+        'dsn' => 'https://secret@ingest.example.test/1',
+        'environment' => 'test',
+        'http_client' => $splitClient,
+        'request_factory' => $factory,
+        'stream_factory' => $factory,
+        'auto_capture' => false,
+        'on_diagnostic' => static function (string $message) use (&$mixedWarnings): void {
+            $mixedWarnings[] = $message;
+        },
+        'before_send' => static function (array $event): array {
+            if ($event['message'] === 'too big to send') {
+                // Base64 of random bytes does not compress, so this really is
+                // over the cap once gzipped.
+                $event['padding'] = base64_encode(random_bytes(2 * 1024 * 1024));
+            }
+
+            return $event;
+        },
+    ]);
+    // The oversized event is queued first, so halving separates it from the two
+    // that could be sent if MONICA were up.
+    $mixedClient->captureMessage('too big to send');
+    $mixedClient->captureMessage('b');
+    $mixedClient->captureMessage('c');
+    expect(count($mixedClient->queuedEvents()) === 3, 'the test should have queued three events');
+    expect(!$mixedClient->flush(), 'a 5xx should make flush() answer no');
+    $remaining = array_map(
+        static function (array $event) {
+            return $event['message'];
+        },
+        $mixedClient->queuedEvents()
+    );
+    expect(
+        $remaining === ['b', 'c'],
+        'the dropped item should leave the queue while the rest stays: ' . json_encode($remaining)
+    );
+    expect(
+        count($mixedWarnings) === 1,
+        'the drop should be reported once, not once per flush: ' . json_encode($mixedWarnings)
+    );
+    // MONICA comes back: the loss is reported in the envelope that finally
+    // leaves, and the oversized item is not tried again.
+    $splitClient->status = 202;
+    $splitClient->envelopes = [];
+    expect($mixedClient->flush(), 'the rest of the queue should be accepted once MONICA is up');
+    expect(
+        count($mixedWarnings) === 1,
+        'the dropped item should not be dropped a second time: ' . json_encode($mixedWarnings)
+    );
+    expect(count($splitClient->envelopes) === 1, 'the remaining events should fit one envelope');
+    expect(
+        $splitClient->envelopes[0]['discarded'] === 1,
+        'the drop should be reported as discarded even though the flush that dropped it failed: '
+        . json_encode($splitClient->envelopes[0]['discarded'])
+    );
+    expect(
+        $itemsOf($splitClient->envelopes) === ['b', 'c'],
+        'only the sendable events should be sent: ' . json_encode($itemsOf($splitClient->envelopes))
+    );
+
     // A failure part-way through stops the run: whatever refused one piece
     // refuses the rest.
     $splitClient->envelopes = [];

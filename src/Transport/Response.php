@@ -40,6 +40,8 @@ final class Response
     /** @var list<array{path: string, message: string}> */
     private array $issues;
     private int $droppedItems = 0;
+    /** @var list<int> */
+    private array $droppedItemIndexes = [];
 
     /**
      * @param list<array{path: string, message: string}> $issues
@@ -107,15 +109,24 @@ final class Response
     }
 
     /**
-     * The same response, plus the number of items that were dropped for being
-     * too large to fit an envelope on their own (see EnvelopeSplitter). The
-     * count belongs on the result rather than in a log line only, because the
-     * caller has to report it in the next envelope's `discarded`.
+     * The same response, plus the items that were dropped for being too large
+     * to fit an envelope on their own (see EnvelopeSplitter).
+     *
+     * This belongs on the result rather than in a log line only, because the
+     * caller has to report the loss in the next envelope's `discarded` -- and,
+     * when the send failed part-way, has to take the dropped items out of its
+     * queue. Retrying them would drop them again, once per flush, for ever.
+     *
+     * The indexes are positions in the `items` array of the envelope that was
+     * handed to the transport.
+     *
+     * @param list<int> $indexes
      */
-    public function withDroppedItems(int $dropped): self
+    public function withDroppedItems(int $dropped, array $indexes = []): self
     {
         $copy = clone $this;
         $copy->droppedItems = max(0, $dropped);
+        $copy->droppedItemIndexes = array_values(array_map('intval', $indexes));
 
         return $copy;
     }
@@ -124,6 +135,18 @@ final class Response
     public function droppedItems(): int
     {
         return $this->droppedItems;
+    }
+
+    /**
+     * Which items were dropped, as positions in the envelope that was sent.
+     * Empty when nothing was dropped, and possibly shorter than
+     * `droppedItems()` for a transport that only counted them.
+     *
+     * @return list<int>
+     */
+    public function droppedItemIndexes(): array
+    {
+        return $this->droppedItemIndexes;
     }
 
     /** One of the Outcome constants. */

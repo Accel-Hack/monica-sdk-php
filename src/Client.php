@@ -187,6 +187,11 @@ final class Client
             $this->lastResponse = $response;
             $sent = $response->outcome() === Outcome::ACCEPTED;
             if (!$sent) {
+                // The send failed, but anything the transport dropped along the
+                // way is still gone: an item too large for one envelope cannot
+                // be sent by trying again. Leaving it in the queue would drop
+                // it -- and warn about it -- once per flush, for ever.
+                $this->forgetDropped($response);
                 $accepted = false;
                 break;
             }
@@ -324,6 +329,31 @@ final class Client
     public function isStopped(): bool
     {
         return $this->transport instanceof StoppableInterface && $this->transport->isStopped();
+    }
+
+    /**
+     * Take the items the transport dropped out of the queue and count them as
+     * discarded, so the next envelope reports the loss.
+     *
+     * The indexes are positions in the envelope that was just attempted, which
+     * is the front of the queue. A transport that only counted its drops
+     * without saying which they were leaves the queue alone: guessing would
+     * throw away the wrong events.
+     */
+    private function forgetDropped(Response $response): void
+    {
+        $indexes = $response->droppedItemIndexes();
+        if ($indexes === []) {
+            return;
+        }
+        // Back to front, so the earlier positions are still where they were.
+        rsort($indexes);
+        foreach ($indexes as $index) {
+            if ($index >= 0 && $index < count($this->queue)) {
+                array_splice($this->queue, $index, 1);
+                $this->discarded++;
+            }
+        }
     }
 
     /**
