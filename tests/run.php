@@ -799,8 +799,11 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
         'a stopped transport should keep answering 401 / REJECTED_STOP'
     );
     expect(
-        $afterStop->issues() === [],
-        'a short-circuited 401 has no body and so no issues'
+        $afterStop->issues() === []
+        && $afterStop->errorCode() === null
+        && $afterStop->errorMessage() === null,
+        'a short-circuited 401 is synthesised without asking MONICA, so it has no body: '
+        . 'no error code, no message, no issues'
     );
     expect(
         count($stopWarnings) === 1,

@@ -152,6 +152,17 @@ jobs:
                 exit(1);
               }
             }
+            foreach ([
+              Monica\Transport\TransportInterface::class,
+              Monica\Transport\OutcomeAwareInterface::class,
+              Monica\Transport\ResponseAwareInterface::class,
+              Monica\Transport\StoppableInterface::class,
+            ] as $interface) {
+              if (!interface_exists($interface)) {
+                fwrite(STDERR, $interface . " is not autoloadable from the published package\n");
+                exit(1);
+              }
+            }
             echo "autoload ok\n";'
 
   release:

@@ -17,6 +17,13 @@ if (!is_file($autoload)) {
 }
 require $autoload;
 
+// Both commands run on a terminal or under cron, and the point of a warning is
+// that whoever ran them reads it. error_log() would put it wherever php.ini
+// says, which for a cron job is usually nowhere anyone looks.
+$diagnostics = new Diagnostics(static function (string $message): void {
+    fwrite(STDERR, $message . "\n");
+});
+
 $command = isset($argv[1]) ? $argv[1] : 'help';
 $options = getopt('', ['dsn::', 'environment::', 'release::', 'spool-dir::', 'timeout-ms::']);
 $dsn = isset($options['dsn']) ? (string) $options['dsn'] : (string) getenv('MONICA_DSN');
@@ -40,8 +47,6 @@ if ($command === 'test') {
         'release' => $release !== '' ? $release : null,
         'auto_capture' => false,
         'request_timeout_ms' => $timeout,
-        // The point of this command is to be read on the terminal that ran it,
-        // so a rejection goes to STDERR instead of wherever error_log points.
         'on_diagnostic' => static function (string $message): void {
             fwrite(STDERR, $message . "\n");
         },
@@ -81,7 +86,7 @@ if ($command === 'spool:flush') {
         fwrite(STDERR, "MONICA_DSN or --dsn is required.\n");
         exit(2);
     }
-    $flusher = new SpoolFlusher($spoolDirectory, new CurlTransport($dsn));
+    $flusher = new SpoolFlusher($spoolDirectory, new CurlTransport($dsn, $diagnostics));
     $result = $flusher->flush($timeout);
     fwrite(
         STDOUT,

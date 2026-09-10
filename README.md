@@ -62,6 +62,10 @@ requestを投げずに `401` を返すだけになります。PHPのprocessは�
 `spool:flush` も同じで、`401` を受けた1通を `.rejected` へ退けてそのrunを打ち切り、
 残りは次のrunで送り直します。
 
+停止後に返る `401` はMONICAに問い合わせずに合成したものなので body を持ちません。
+`lastResponse()` の `status()` は `401` ですが、`errorCode()` / `errorMessage()` は
+`null`、`issues()` は空です（本物の `401` を受けた1回だけ、bodyがあれば code が入ります）。
+
 `422`（envelope schema 不正）は、拒否レスポンスの body（`error.json`）を読んで
 **既定で `error_log()` へ1行の警告を出します**。envelope のどのフィールドが拒否された
 かは `error.issues[].path` にあり、これはアプリ側で直せる唯一の失敗なので、黙って
