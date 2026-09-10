@@ -101,28 +101,20 @@ body を読みません）。
 
 ## envelopeの分割
 
-`ingest.md` は envelope 1 通の上限を gzip 後 1 MiB・展開後 8 MiB と定めています。
-item 数 100 での分割（`batch_size`）だけでは足りません。大きな `contexts` や
-200 frame の stacktrace が並ぶと、100 件未満でも byte 上限を超えます。
+envelope 1 通の上限は gzip 後 1 MiB・展開後 8 MiB です（`ingest.md`）。item 数 100 で
+の分割（`batch_size`）とは別に、transport が送信前に gzip 後の byte 数を測り、
+**上限を超える envelope を item 境界で半分に割って**、収まるまで繰り返します。
+1 通が複数 requestになります。MONICA が `413` を返した場合も割って送り直します。
 
-transport は送信前に gzip 後の byte 数を測り、**上限を超える envelope を item 境界で
-半分に割って**、収まるまで繰り返します。1 通が複数 requestになりますが、
-`1 request = 1 envelope` は保たれます（`discarded` は分割の先頭だけが持ちます。
-両方に写すと二重に報告されるため）。MONICA が `413` を返した場合も同じで、
-上限は MONICA 側のものなので、その envelope を割って送り直します。
-
-**item 1 件だけで上限を超える場合はその item を捨てます。** それ以上割れず、
-送り直しても永久に `413` になるだけで、後続の envelope が出られなくなるからです。
-捨てたことは警告に出し、次の envelope の `discarded` で MONICA にも伝えます。
+**item 1 件だけで上限を超える場合はその item を捨てます。** 捨てたことは警告に出し、
+次の envelope の `discarded` で MONICA にも伝えます。
 
 ```text
 monica: dropped 1 item(s) that cannot fit one envelope (1234567 gzip bytes, limit 1048576, measured by the SDK); the event(s) are lost
 ```
 
 byte 上限は `Monica\Transport\EnvelopeSplitter::MAX_GZIP_BYTES` /
-`MAX_DECOMPRESSED_BYTES` の定数です（配布物に `spec/` は入らないので実行時に
-読む先がありません）。契約テストが `limits.json` と突き合わせるので、MONICA が
-上限を変えるとテストが落ちます。
+`MAX_DECOMPRESSED_BYTES` の定数です。
 
 DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
 送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
