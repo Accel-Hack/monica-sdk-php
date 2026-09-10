@@ -99,6 +99,31 @@ body が空・非JSON・`error.json` に適合しない・64 KiBを超える場�
 issues無しの拒否として扱います。`400` などの他の4xxは警告を出しません（`429` は
 body を読みません）。
 
+## envelopeの分割
+
+`ingest.md` は envelope 1 通の上限を gzip 後 1 MiB・展開後 8 MiB と定めています。
+item 数 100 での分割（`batch_size`）だけでは足りません。大きな `contexts` や
+200 frame の stacktrace が並ぶと、100 件未満でも byte 上限を超えます。
+
+transport は送信前に gzip 後の byte 数を測り、**上限を超える envelope を item 境界で
+半分に割って**、収まるまで繰り返します。1 通が複数 requestになりますが、
+`1 request = 1 envelope` は保たれます（`discarded` は分割の先頭だけが持ちます。
+両方に写すと二重に報告されるため）。MONICA が `413` を返した場合も同じで、
+上限は MONICA 側のものなので、その envelope を割って送り直します。
+
+**item 1 件だけで上限を超える場合はその item を捨てます。** それ以上割れず、
+送り直しても永久に `413` になるだけで、後続の envelope が出られなくなるからです。
+捨てたことは警告に出し、次の envelope の `discarded` で MONICA にも伝えます。
+
+```text
+monica: dropped 1 item(s) that cannot fit one envelope (1234567 gzip bytes, limit 1048576, measured by the SDK); the event(s) are lost
+```
+
+byte 上限は `Monica\Transport\EnvelopeSplitter::MAX_GZIP_BYTES` /
+`MAX_DECOMPRESSED_BYTES` の定数です（配布物に `spec/` は入らないので実行時に
+読む先がありません）。契約テストが `limits.json` と突き合わせるので、MONICA が
+上限を変えるとテストが落ちます。
+
 DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
 送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
 `401`になり、eventが黙って消えるだけだからです。
@@ -183,13 +208,12 @@ PHP だけ気付けない状態を作らないためです。schema を通るこ
 
 ### まだ実装していない契約
 
-`transport.json` のうち実装しているのは `endpoint` / `dsn` / `auth` と `status` の
-一部です。残っているのは次の2つです。
+`transport.json` のうち実装しているのは `endpoint` / `dsn` / `auth` と `status` です。
+`413` は transport が envelope を分割して送り直します（[envelopeの分割](#envelopeの分割)）。
+残っているのは次の1つです。
 
 - `retry`（`Retry-After`、backoff、回数上限）。再送は次の flush で送り直すだけで、
   待ち時間も回数上限もありません。`shutdown` は再送しません
-- `413` の `split_and_retry`。envelope の byte 上限（gzip 1 MiB / 展開後 8 MiB）での
-  分割が未実装で、恒久失敗として扱います。item 数 100 での分割はあります
 
 契約テストは `transport.json` の section 名、status の語彙、status ごとの分類を
 固定しています。

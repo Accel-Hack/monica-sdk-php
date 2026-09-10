@@ -191,7 +191,11 @@ final class Client
                 break;
             }
             array_splice($this->queue, 0, count($items));
-            $this->discarded = 0;
+            // Items the transport had to drop for being too large to fit an
+            // envelope on their own are losses like a queue overflow, so they
+            // are reported in the next envelope's `discarded` rather than
+            // disappearing silently.
+            $this->discarded = $response->droppedItems();
         }
 
         return $accepted && $this->queue === [];

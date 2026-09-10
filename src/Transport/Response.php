@@ -39,6 +39,7 @@ final class Response
     private ?string $errorMessage;
     /** @var list<array{path: string, message: string}> */
     private array $issues;
+    private int $droppedItems = 0;
 
     /**
      * @param list<array{path: string, message: string}> $issues
@@ -103,6 +104,26 @@ final class Response
     public static function carriesDiagnostics(int $status): bool
     {
         return $status >= 400 && $status < 500 && $status !== 429;
+    }
+
+    /**
+     * The same response, plus the number of items that were dropped for being
+     * too large to fit an envelope on their own (see EnvelopeSplitter). The
+     * count belongs on the result rather than in a log line only, because the
+     * caller has to report it in the next envelope's `discarded`.
+     */
+    public function withDroppedItems(int $dropped): self
+    {
+        $copy = clone $this;
+        $copy->droppedItems = max(0, $dropped);
+
+        return $copy;
+    }
+
+    /** How many items were dropped as unsendable while sending this envelope. */
+    public function droppedItems(): int
+    {
+        return $this->droppedItems;
     }
 
     /** One of the Outcome constants. */

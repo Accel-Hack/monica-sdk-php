@@ -31,15 +31,17 @@ final class Outcome
         if ($status === 401) {
             return self::REJECTED_STOP;
         }
-        if ($status === 429 || $status >= 500) {
+        // 413 is `split_and_retry`: the bytes are refused, not the content, so
+        // the same items can be accepted once they are spread over more than
+        // one envelope. EnvelopeSplitter does that inside the transport, which
+        // is why a 413 rarely reaches a caller at all -- but classifying it as
+        // permanent would be wrong now that resending is not futile.
+        if ($status === 429 || $status === 413 || $status >= 500) {
             return self::RETRYABLE;
         }
 
-        // 413 is `split_and_retry` in transport.json, but splitting on the byte
-        // limits is not implemented: resending the identical body can only earn
-        // another 413. Dropping it is deliberate -- retrying forever would stall
-        // every envelope queued behind it. 400 and 422 are permanent by spec,
-        // and an unknown status is treated the same way rather than retried.
+        // 400 and 422 are permanent by spec, and an unknown status is treated
+        // the same way rather than retried.
         return self::REJECTED;
     }
 }

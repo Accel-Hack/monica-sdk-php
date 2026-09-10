@@ -81,8 +81,21 @@ final class Diagnostics
             return;
         }
 
+        $this->warn(self::describe($response), $response);
+    }
+
+    /**
+     * Report something the SDK decided by itself -- an envelope it will not
+     * even try to send, say -- through the same handler as a rejection.
+     */
+    public function warn(string $message, ?Response $context = null): void
+    {
+        if ($this->handler === null) {
+            return;
+        }
+
         try {
-            call_user_func($this->handler, self::describe($response), $response);
+            call_user_func($this->handler, $message, $context ?? Response::forOutcome(Outcome::REJECTED));
         } catch (Throwable $ignored) {
             // A reporting handler is application code, and this runs while an
             // event is already being lost. Letting it throw would turn a
