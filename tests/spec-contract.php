@@ -38,6 +38,7 @@ use Monica\EventFactory;
 use Monica\Tests\Spec\JsonSchema;
 use Monica\Transport\Dsn;
 use Monica\Transport\Outcome;
+use Monica\Transport\Response;
 use Monica\Transport\TransportInterface;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Http\Client\ClientInterface;
@@ -275,11 +276,11 @@ foreach ([
     );
 }
 
-// error.json is the shape of a rejection. This SDK does not read the body yet:
-// its transports only distinguish 2xx from everything else, and the retry
-// policy in transport.json is unimplemented (see README). So what is pinned
-// here is the schema being usable and the two fields a retry implementation
-// will need, not conformance the SDK does not yet have.
+// error.json is the shape of a rejection, and the SDK reads it: a 422 body is
+// parsed into Monica\Transport\Response so `issues[].path` reaches the caller.
+// So this pins both sides -- the schema still saying what the parser assumes,
+// and the parser getting the fields out of the body the bundle documents. A
+// contract that grew a field the parser drops fails here rather than in ingest.
 $errorSchema = JsonSchema::fromFile($specDirectory . '/error.json');
 expect(
     $errorSchema->pointer('/$id') === 'https://spec.monica.accelhack.net/v1/error.json',
@@ -289,11 +290,10 @@ expect(
     $errorSchema->pointer('/$defs/validationIssue/required') === ['path', 'message'],
     'a 422 issue must keep carrying both a path and a message'
 );
-$documentedRejection = json_decode(
+$documentedRejectionBody =
     '{"error":{"code":"invalid_envelope","message":"The envelope does not match the MONICA schema",'
-    . '"issues":[{"path":"$.items[0].exception.values[0].mechanism.type","message":"Invalid type"}]}}',
-    false
-);
+    . '"issues":[{"path":"$.items[0].exception.values[0].mechanism.type","message":"Invalid type"}]}}';
+$documentedRejection = json_decode($documentedRejectionBody, false);
 $rejectionErrors = $errorSchema->validate($documentedRejection);
 if ($rejectionErrors !== []) {
     fail(
@@ -301,6 +301,27 @@ if ($rejectionErrors !== []) {
         . '  - ' . implode(PHP_EOL . '  - ', $rejectionErrors)
     );
 }
+
+// ingest.md's own example of a 422, read the way a transport reads it. The
+// point of reading the body at all is `issues[].path`, so it is the path that
+// has to come out, not merely a parse that did not throw.
+$parsedRejection = Response::forStatus(422, $documentedRejectionBody);
+expect(
+    $parsedRejection->outcome() === Outcome::REJECTED,
+    'reading the body must not change what happens to a 422: it is still dropped'
+);
+expect(
+    $parsedRejection->errorCode() === 'invalid_envelope',
+    'error.code from the documented rejection should reach the caller'
+);
+expect(
+    $parsedRejection->issues() === [[
+        'path' => '$.items[0].exception.values[0].mechanism.type',
+        'message' => 'Invalid type',
+    ]],
+    'the documented rejection issues should reach the caller: '
+    . json_encode($parsedRejection->issues())
+);
 
 $definitions = $schema->definitionNames();
 $serialized = (string) file_get_contents($specDirectory . '/envelope.json');
@@ -631,8 +652,9 @@ expect(
 );
 
 // This SDK implements part of transport.json. `status` has a consumer now --
-// Outcome classifies a response and the spool flusher acts on it -- but not
-// every cell of the table (see the mapping below), and `retry` still has none:
+// Outcome classifies a response, the spool flusher acts on it, and a 422's
+// error.json body is read so its issues reach the caller -- but not every cell
+// of the table (see the mapping below), and `retry` still has no consumer:
 // nothing reads `Retry-After` or backs off. Pinning the vocabulary here turns
 // "MONICA grew an obligation the PHP SDK ignores" into a failing test instead of
 // a silent gap.

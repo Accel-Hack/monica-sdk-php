@@ -5,6 +5,7 @@ declare(strict_types=1);
 
 use Monica\Client;
 use Monica\Transport\CurlTransport;
+use Monica\Transport\Diagnostics;
 use Monica\Transport\SpoolFlusher;
 
 $autoload = isset($GLOBALS['_composer_autoload_path'])
@@ -39,11 +40,35 @@ if ($command === 'test') {
         'release' => $release !== '' ? $release : null,
         'auto_capture' => false,
         'request_timeout_ms' => $timeout,
+        // The point of this command is to be read on the terminal that ran it,
+        // so a rejection goes to STDERR instead of wherever error_log points.
+        'on_diagnostic' => static function (string $message): void {
+            fwrite(STDERR, $message . "\n");
+        },
     ]);
     $client->captureMessage('MONICA PHP SDK connectivity test', 'info', [
         'tags' => ['source' => 'monica-cli'],
     ]);
     if (!$client->flush($timeout)) {
+        $response = $client->lastResponse();
+        // A 422 and a 401 have already printed themselves through the handler
+        // above. Every other failure only has a status, and saying which one it
+        // was is the difference between a wrong key and MONICA being down.
+        if (
+            $response !== null
+            && $response->status() !== null
+            && !Diagnostics::reports($response->status())
+        ) {
+            fwrite(
+                STDERR,
+                'MONICA answered HTTP ' . $response->status()
+                . ($response->errorCode() !== null ? ' (' . $response->errorCode() . ')' : '')
+                . ".\n"
+            );
+            foreach ($response->issues() as $issue) {
+                fwrite(STDERR, ' - ' . $issue['path'] . ': ' . $issue['message'] . "\n");
+            }
+        }
         fwrite(STDERR, "MONICA connectivity test failed.\n");
         exit(1);
     }

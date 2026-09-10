@@ -7,14 +7,16 @@ namespace Monica\Transport;
 use RuntimeException;
 use Throwable;
 
-final class CurlTransport implements TransportInterface, OutcomeAwareInterface
+final class CurlTransport implements TransportInterface, OutcomeAwareInterface, ResponseAwareInterface
 {
     /** @var array{endpoint: string, key: string} */
     private array $dsn;
+    private Diagnostics $diagnostics;
 
-    public function __construct(string $dsn)
+    public function __construct(string $dsn, ?Diagnostics $diagnostics = null)
     {
         $this->dsn = Dsn::parse($dsn);
+        $this->diagnostics = $diagnostics ?? new Diagnostics();
     }
 
     public function send(array $envelope, int $timeoutMilliseconds): bool
@@ -23,6 +25,11 @@ final class CurlTransport implements TransportInterface, OutcomeAwareInterface
     }
 
     public function sendEnvelope(array $envelope, int $timeoutMilliseconds): string
+    {
+        return $this->sendEnvelopeResponse($envelope, $timeoutMilliseconds)->outcome();
+    }
+
+    public function sendEnvelopeResponse(array $envelope, int $timeoutMilliseconds): Response
     {
         if (!function_exists('curl_init')) {
             throw new RuntimeException('The cURL extension is required when no PSR-18 client is supplied');
@@ -39,10 +46,30 @@ final class CurlTransport implements TransportInterface, OutcomeAwareInterface
             throw new RuntimeException('Unable to initialize cURL');
         }
 
+        // A rejection body is read through a write callback rather than
+        // collected by cURL, so a MONICA that answers with megabytes cannot
+        // make the SDK hold them: anything past the cap is dropped as it
+        // arrives. The callback keeps returning the full chunk length, because
+        // returning less aborts the transfer and would lose the status too.
+        $body = '';
+        $oversized = false;
+        $collect = static function ($handle, string $chunk) use (&$body, &$oversized): int {
+            unset($handle);
+            $length = strlen($chunk);
+            if (strlen($body) + $length > Response::MAX_BODY_BYTES) {
+                $oversized = true;
+            } else {
+                $body .= $chunk;
+            }
+
+            return $length;
+        };
+
         try {
             curl_setopt_array($handle, [
                 CURLOPT_POST => true,
                 CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_WRITEFUNCTION => $collect,
                 CURLOPT_HEADER => false,
                 CURLOPT_HTTPHEADER => [
                     'Authorization: Bearer ' . $this->dsn['key'],
@@ -57,12 +84,21 @@ final class CurlTransport implements TransportInterface, OutcomeAwareInterface
             $result = curl_exec($handle);
             if ($result === false) {
                 // A network failure, which transport.json says to retry.
-                return Outcome::RETRYABLE;
+                return Response::forNetworkFailure();
             }
 
-            return Outcome::forStatus((int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE));
+            $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
+            $response = Response::forStatus(
+                $status,
+                $oversized || !Response::carriesDiagnostics($status) ? null : $body
+            );
+            // Reporting cannot throw, so this does not fall through to the
+            // network failure below.
+            $this->diagnostics->report($response);
+
+            return $response;
         } catch (Throwable $ignored) {
-            return Outcome::RETRYABLE;
+            return Response::forNetworkFailure();
         } finally {
             curl_close($handle);
         }

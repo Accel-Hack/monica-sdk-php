@@ -6,7 +6,12 @@ namespace Monica;
 
 use InvalidArgumentException;
 use Monica\Transport\CurlTransport;
+use Monica\Transport\Diagnostics;
+use Monica\Transport\Outcome;
+use Monica\Transport\OutcomeAwareInterface;
 use Monica\Transport\Psr18Transport;
+use Monica\Transport\Response;
+use Monica\Transport\ResponseAwareInterface;
 use Monica\Transport\SpoolTransport;
 use Monica\Transport\TransportInterface;
 use Psr\Http\Client\ClientInterface;
@@ -42,6 +47,7 @@ final class Client
     private ?string $memoryReserve;
     /** @var callable */
     private $random;
+    private ?Response $lastResponse = null;
 
     /**
      * @param array<string, mixed> $options
@@ -168,15 +174,17 @@ final class Client
             ];
             $this->handling = true;
             try {
-                $sent = $this->transport->send(
+                $response = $this->sendEnvelope(
                     $envelope,
                     min($timeoutMilliseconds, $this->requestTimeoutMilliseconds)
                 );
             } catch (Throwable $ignored) {
-                $sent = false;
+                $response = Response::forNetworkFailure();
             } finally {
                 $this->handling = false;
             }
+            $this->lastResponse = $response;
+            $sent = $response->outcome() === Outcome::ACCEPTED;
             if (!$sent) {
                 $accepted = false;
                 break;
@@ -288,10 +296,51 @@ final class Client
     }
 
     /**
+     * What MONICA answered to the last envelope `flush()` tried to send: the
+     * HTTP status, `error.code`, and for a 422 the `issues[].path` naming the
+     * fields ingest refused. Null before the first attempt.
+     *
+     * `flush()` keeps answering yes or no. This is the same failure with the
+     * reason attached, for a caller that wants to log or assert on it.
+     */
+    public function lastResponse(): ?Response
+    {
+        return $this->lastResponse;
+    }
+
+    /**
+     * Hand the envelope to the transport, asking for the most detailed answer
+     * it can give. A transport from outside the SDK may only answer yes or no,
+     * and a no keeps meaning "try again later" as it did before outcomes.
+     *
+     * @param array<string, mixed> $envelope
+     */
+    private function sendEnvelope(array $envelope, int $timeoutMilliseconds): Response
+    {
+        if ($this->transport instanceof ResponseAwareInterface) {
+            return $this->transport->sendEnvelopeResponse($envelope, $timeoutMilliseconds);
+        }
+        if ($this->transport instanceof OutcomeAwareInterface) {
+            return Response::forOutcome($this->transport->sendEnvelope($envelope, $timeoutMilliseconds));
+        }
+
+        return Response::forOutcome(
+            $this->transport->send($envelope, $timeoutMilliseconds)
+                ? Outcome::ACCEPTED
+                : Outcome::RETRYABLE
+        );
+    }
+
+    /**
      * @param array<string, mixed> $options
      */
     private function createHttpTransport(string $dsn, array $options): TransportInterface
     {
+        // `on_diagnostic` reaches the transport rather than this class: the
+        // transport is the only place a response body exists, and it is the one
+        // step both the direct path and the spool flusher go through, so the
+        // warning is emitted once per envelope on either.
+        $diagnostics = Diagnostics::fromOptions($options);
         $client = $options['http_client'] ?? null;
         $requestFactory = $options['request_factory'] ?? null;
         $streamFactory = $options['stream_factory'] ?? null;
@@ -306,10 +355,10 @@ final class Client
                 );
             }
 
-            return new Psr18Transport($dsn, $client, $requestFactory, $streamFactory);
+            return new Psr18Transport($dsn, $client, $requestFactory, $streamFactory, $diagnostics);
         }
 
-        return new CurlTransport($dsn);
+        return new CurlTransport($dsn, $diagnostics);
     }
 
     private function capturePhpError(

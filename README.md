@@ -53,6 +53,41 @@ requestを待って出られなくなるためです。`429` / `5xx` とネッ�
 残り、次のflushで送り直します。`401`はその1通を退けてflushを打ち切ります。
 `spool:flush` の出力の `rejected` がこれで、0 でなければ exit code は 1 です。
 
+`422`（envelope schema 不正）は、拒否レスポンスの body（`error.json`）を読んで
+**既定で `error_log()` へ1行の警告を出します**。envelope のどのフィールドが拒否された
+かは `error.issues[].path` にあり、これはアプリ側で直せる唯一の失敗なので、黙って
+捨てると「いつからかeventが届かない」だけが残ります。`401`（キー自体が拒否され、
+その flush を打ち切る）も同じく1行出します。
+
+```text
+monica: ingest rejected the envelope with 422 (invalid_envelope): 1 issue(s); $.items[0].request.method: Invalid type: Expected string
+monica: ingest rejected the envelope with 401 (invalid_key); no further envelopes will be sent
+```
+
+書式は6つのSDKで揃えてあります。`error.code` が body から読めないときは `unknown`
+です。
+
+出力先は `on_diagnostic` で差し替えられます（`callable` を渡すと
+`(string $message, \Monica\Transport\Response $response)` を受け取り、
+`false` / `null` で無効）。ログに出るのはMONICAが返した内容だけで、envelopeやAPIキーは
+含みません。プログラムから読む場合は `Client::lastResponse()`（`spool:flush` 経路は
+`SpoolFlusher::lastResponse()`）が `status()` / `errorCode()` / `errorMessage()` /
+`issues()` を持つ `Response` を返します。`flush()` の戻り値の意味は変わりません。
+
+```php
+if (!\Monica\Monica::flush()) {
+    $response = \Monica\Monica::lastResponse();
+    foreach ($response !== null ? $response->issues() : [] as $issue) {
+        // $issue['path'] / $issue['message']
+    }
+}
+```
+
+body が空・非JSON・`error.json` に適合しない・64 KiBを超える場合は、例外を投げずに
+issues無しの拒否として扱います。`400` などの他の4xxも body は読むので `Response` から
+`issues()` が取れますが、警告は出さず、破棄という扱いは変わりません（`429` は body を
+読みません）。`429` / `5xx` の再送も変わりません。
+
 DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
 送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
 `401`になり、eventが黙って消えるだけだからです。
@@ -148,8 +183,6 @@ PHP だけ気付けない状態を作らないためです。schema を通るこ
 - `413` の `split_and_retry`。envelope の byte 上限（gzip 1 MiB / 展開後 8 MiB）での
   分割が未実装なので、同じ byte を送り直しても `413` のままです。いまは恒久失敗として
   扱っています。item 数 100 での分割はあります
-
-`error.json` の body も読んでいません（`422` の `issues` が見えません）。
 
 黙って取り残されないように、契約テストは `transport.json` の section 名と status の
 語彙、それに status ごとの分類そのものを固定しています。MONICA 側が section や status

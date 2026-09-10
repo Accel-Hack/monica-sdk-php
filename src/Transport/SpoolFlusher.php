@@ -11,6 +11,7 @@ final class SpoolFlusher
     private string $directory;
     private TransportInterface $transport;
     private int $claimTtlSeconds;
+    private ?Response $lastResponse = null;
 
     public function __construct(
         string $directory,
@@ -90,19 +91,48 @@ final class SpoolFlusher
     }
 
     /**
+     * What MONICA answered to the last envelope this flusher tried to send,
+     * including a 422's `issues[].path`. Null before the first attempt.
+     *
+     * The counters `flush()` returns say how the run went; this says why the
+     * last attempt in it ended that way. The warning for a rejected envelope is
+     * emitted by the transport, so it appears on this path without the caller
+     * reading anything.
+     */
+    public function lastResponse(): ?Response
+    {
+        return $this->lastResponse;
+    }
+
+    /**
      * @param array<string, mixed> $envelope
      */
     private function outcomeOf(array $envelope, int $timeoutMilliseconds): string
     {
+        $this->lastResponse = $this->responseOf($envelope, $timeoutMilliseconds);
+
+        return $this->lastResponse->outcome();
+    }
+
+    /**
+     * @param array<string, mixed> $envelope
+     */
+    private function responseOf(array $envelope, int $timeoutMilliseconds): Response
+    {
+        if ($this->transport instanceof ResponseAwareInterface) {
+            return $this->transport->sendEnvelopeResponse($envelope, $timeoutMilliseconds);
+        }
         if ($this->transport instanceof OutcomeAwareInterface) {
-            return $this->transport->sendEnvelope($envelope, $timeoutMilliseconds);
+            return Response::forOutcome($this->transport->sendEnvelope($envelope, $timeoutMilliseconds));
         }
 
         // A transport supplied from outside only answers yes or no. Treating a
         // no as retryable keeps the behaviour it had before outcomes existed.
-        return $this->transport->send($envelope, $timeoutMilliseconds)
-            ? Outcome::ACCEPTED
-            : Outcome::RETRYABLE;
+        return Response::forOutcome(
+            $this->transport->send($envelope, $timeoutMilliseconds)
+                ? Outcome::ACCEPTED
+                : Outcome::RETRYABLE
+        );
     }
 
     private function recoverStaleClaims(): void
