@@ -57,8 +57,8 @@ final class CurlTransport implements
         }
 
         $json = json_encode($envelope, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
-        $body = gzencode($json, 6);
-        if ($body === false) {
+        $requestBody = gzencode($json, 6);
+        if ($requestBody === false) {
             throw new RuntimeException('Unable to gzip the MONICA envelope');
         }
 
@@ -72,15 +72,15 @@ final class CurlTransport implements
         // make the SDK hold them: anything past the cap is dropped as it
         // arrives. The callback keeps returning the full chunk length, because
         // returning less aborts the transfer and would lose the status too.
-        $body = '';
+        $responseBody = '';
         $oversized = false;
-        $collect = static function ($handle, string $chunk) use (&$body, &$oversized): int {
+        $collect = static function ($handle, string $chunk) use (&$responseBody, &$oversized): int {
             unset($handle);
             $length = strlen($chunk);
-            if (strlen($body) + $length > Response::MAX_BODY_BYTES) {
+            if (strlen($responseBody) + $length > Response::MAX_BODY_BYTES) {
                 $oversized = true;
             } else {
-                $body .= $chunk;
+                $responseBody .= $chunk;
             }
 
             return $length;
@@ -97,7 +97,7 @@ final class CurlTransport implements
                     'Content-Type: application/json',
                     'Content-Encoding: gzip',
                 ],
-                CURLOPT_POSTFIELDS => $body,
+                CURLOPT_POSTFIELDS => $requestBody,
                 CURLOPT_CONNECTTIMEOUT_MS => $timeoutMilliseconds,
                 CURLOPT_TIMEOUT_MS => $timeoutMilliseconds,
                 CURLOPT_NOSIGNAL => true,
@@ -111,7 +111,7 @@ final class CurlTransport implements
             $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
             $response = Response::forStatus(
                 $status,
-                $oversized || !Response::carriesDiagnostics($status) ? null : $body
+                $oversized || !Response::carriesDiagnostics($status) ? null : $responseBody
             );
             if ($response->outcome() === Outcome::REJECTED_STOP) {
                 $this->stopped = true;

@@ -878,6 +878,7 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
 // file exercises the default transport's response handling at all.
 if (function_exists('curl_init') && function_exists('proc_open')) {
     $controlFile = (string) tempnam(sys_get_temp_dir(), 'monica-stub-');
+    $logFilePath = (string) tempnam(sys_get_temp_dir(), 'monica-stub-log-');
     $socket = @stream_socket_server('tcp://127.0.0.1:0', $errorNumber, $errorMessage);
     expect($socket !== false, 'the test should be able to reserve a port: ' . (string) $errorMessage);
     $address = (string) stream_socket_get_name($socket, false);
@@ -894,7 +895,7 @@ if (function_exists('curl_init') && function_exists('proc_open')) {
         ],
         $pipes,
         null,
-        ['MONICA_STUB_FILE' => $controlFile]
+        ['MONICA_STUB_FILE' => $controlFile, 'MONICA_STUB_LOG' => $logFilePath]
     );
     expect(is_resource($server), 'the test should be able to start a stub ingest server');
 
@@ -929,6 +930,39 @@ if (function_exists('curl_init') && function_exists('proc_open')) {
             );
             $assertCase('cURL', $case, $curlTransport->sendEnvelopeResponse($rejectionEnvelope, 5000), $warnings);
         }
+        // What arrived, not just what came back. A transport that posts an
+        // empty body answers 202 exactly like one that works, so the envelope
+        // itself has to be checked on the server side.
+        expect(
+            file_put_contents($controlFile, (string) json_encode(['status' => 202, 'body' => ''])) !== false,
+            'the test should be able to direct the stub server'
+        );
+        expect(file_put_contents($logFilePath, '') !== false, 'the test should be able to clear the log');
+        $postingCurl = new CurlTransport('http://secret@127.0.0.1:' . $port . '/1');
+        $postedEnvelope = $rejectionEnvelope;
+        $postedEnvelope['items'] = [
+            ['type' => 'message', 'message' => 'posted by cURL'],
+        ];
+        expect(
+            $postingCurl->sendEnvelopeResponse($postedEnvelope, 5000)->outcome() === Outcome::ACCEPTED,
+            'cURL: a 202 should be accepted'
+        );
+        $delivered = array_values(array_filter(explode("\n", (string) file_get_contents($logFilePath))));
+        expect(count($delivered) === 1, 'cURL: exactly one request should have arrived');
+        $arrived = json_decode($delivered[0], true);
+        expect(
+            is_array($arrived) && $arrived['gzipped'] === true && $arrived['gzip_bytes'] > 0,
+            'cURL: the body should arrive as gzip, not empty: ' . $delivered[0]
+        );
+        expect(
+            is_array($arrived) && $arrived['content_encoding'] === 'gzip',
+            'cURL: Content-Encoding: gzip should be declared: ' . $delivered[0]
+        );
+        expect(
+            is_array($arrived) && $arrived['messages'] === ['posted by cURL'],
+            'cURL: the envelope items should arrive intact: ' . $delivered[0]
+        );
+
         // The same stop, on the transport that actually opens a socket.
         expect(
             file_put_contents($controlFile, (string) json_encode([
@@ -970,6 +1004,7 @@ if (function_exists('curl_init') && function_exists('proc_open')) {
         proc_terminate($server);
         proc_close($server);
         @unlink($controlFile);
+        @unlink($logFilePath);
     }
 }
 
