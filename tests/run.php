@@ -996,6 +996,12 @@ $markerOf = static function (string $directory): ?array {
 // A 429 with Retry-After: the envelope waits exactly that long, and the wait is
 // recorded where the next process can see it.
 $waitDirectory = $spoolWith(1);
+// The 14 digits the spool orders by, before any retry touches the name.
+$waitCreatedAt = substr(basename((glob($waitDirectory . '/*.json') ?: [''])[0]), 0, 14);
+expect(
+    preg_match('/^[0-9]{14}$/', $waitCreatedAt) === 1,
+    'a spooled file should start with its creation time: ' . $waitCreatedAt
+);
 $waiting = new RespondingTransport(Response::forStatus(429, null, 30));
 $waitFlusher = new SpoolFlusher($waitDirectory, $waiting, 60);
 $waitResult = $waitFlusher->flush();
@@ -1014,9 +1020,9 @@ expect(
 // The creation time the spool orders by has to survive the rename, or pruning
 // would start dropping the wrong files.
 expect(
-    substr(basename($waitMarker['path']), 0, 14) === substr(basename($waitMarker['path']), 0, 14)
-    && preg_match('/^[0-9]{14}-/', basename($waitMarker['path'])) === 1,
-    'a retried file should keep its creation time at the front: ' . basename($waitMarker['path'])
+    strpos(basename($waitMarker['path']), $waitCreatedAt . '-') === 0,
+    'a retried file should keep the creation time it was written with ('
+    . $waitCreatedAt . '): ' . basename($waitMarker['path'])
 );
 
 // The next flush leaves it alone: sending now is what MONICA asked the SDK not
@@ -1100,6 +1106,43 @@ expect(
     'a recovered claim should keep counting from the attempts it already had'
 );
 $discardSpool($recoverDirectory);
+
+// ... and when its old name is already taken, the recovered file gets a new
+// name but keeps the history: losing the marker here would set its attempts
+// back to zero and start the backoff again.
+$collideDirectory = $spoolWith(1);
+$collideFile = (glob($collideDirectory . '/*.json') ?: [])[0];
+$collideName = (string) preg_replace('/\.json$/', '--try2-at1.json', basename($collideFile));
+expect(
+    rename($collideFile, $collideDirectory . DIRECTORY_SEPARATOR . $collideName),
+    'the test should be able to add retry state'
+);
+// A stale claim on that same name, with the file still in place: recovering it
+// cannot use its original name, which is the collision under test.
+$collideClaim = $collideDirectory . DIRECTORY_SEPARATOR . '.sending-999-' . $collideName;
+expect(
+    copy($collideDirectory . DIRECTORY_SEPARATOR . $collideName, $collideClaim),
+    'the test should be able to leave a stale claim behind'
+);
+expect(touch($collideClaim, time() - 600), 'the test should be able to make the claim stale');
+$collideTransport = new RespondingTransport(Response::forStatus(503, null, 0));
+(new SpoolFlusher($collideDirectory, $collideTransport, 60, new RetryPolicy(5)))->flush();
+$collideMarkers = [];
+foreach (glob($collideDirectory . '/*.json') ?: [] as $file) {
+    $collideMarkers[] = preg_match('/--try([0-9]+)-at([0-9]+)\.json$/', basename($file), $matches) === 1
+        ? (int) $matches[1]
+        : 0;
+}
+sort($collideMarkers);
+// One of the two was sent and failed again (2 -> 3); the other is the recovered
+// file, still at the 2 attempts its name carried. A 0 here means the recovery
+// threw the history away.
+expect(
+    $collideMarkers === [2, 3],
+    'a recovered claim renamed around a collision should keep its attempts, got '
+    . json_encode($collideMarkers)
+);
+$discardSpool($collideDirectory);
 
 // --- 413: splitting an envelope on the byte limits -------------------------
 //

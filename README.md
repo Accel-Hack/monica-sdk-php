@@ -153,6 +153,34 @@ monica: giving up on a spooled envelope after 5 attempt(s); 3 event(s) are lost
 `sent=0 failed=0 deferred=3` は「MONICA が応答しない」ではなく「まだ時刻では
 ない」という意味で、exit code は 0 です。
 
+**待ち時間は次の flush が拾うので、`spool:flush` は定期実行してください。**
+1回しか実行しない運用だと、待ち時間に入った envelope はそのrunでは送られません。
+間隔は backoff の最小値（1秒）より長ければよく、1分程度が扱いやすいです。
+
+```cron
+* * * * * /usr/bin/php /srv/app/vendor/bin/monica spool:flush >> /var/log/monica-spool.log 2>&1
+```
+
+systemd timer なら次のようになります（`MONICA_DSN` は `Environment=` か
+`EnvironmentFile=` で渡します）。
+
+```ini
+# monica-spool.service
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/monica.env
+ExecStart=/usr/bin/php /srv/app/vendor/bin/monica spool:flush
+
+# monica-spool.timer
+[Timer]
+OnUnitActiveSec=1min
+AccuracySec=1s
+```
+
+同時に複数走っても問題ありません（`.sending-` の claim で1通を1processが持ちます）。
+警告（`422` の issues、`401`、諦めた envelope）は STDERR に出るので、上の例のように
+ログへ落としてください。
+
 **直接送信（`shutdown`）は再送しません。** request の中で待つと、その時間は
 利用者の待ち時間になります（mod_php ではレスポンスがブロックされます）。
 `flush()` が false を返した event は queue に残り、同じ process の中で次に

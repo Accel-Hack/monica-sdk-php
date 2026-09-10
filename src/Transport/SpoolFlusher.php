@@ -257,8 +257,16 @@ final class SpoolFlusher
             }
             $target = $this->directory . DIRECTORY_SEPARATOR . $matches[1];
             if (is_file($target)) {
+                // A file of that name is already back in the spool, so this one
+                // needs a new name -- but not a new retry history: dropping the
+                // marker here would set its attempts back to zero and start the
+                // backoff again.
+                $state = self::retryStateOf($matches[1]);
                 $target = $this->directory . DIRECTORY_SEPARATOR
                     . gmdate('YmdHis') . '-recovered-' . bin2hex(random_bytes(8)) . '.json';
+                if ($state['attempts'] > 0 || $state['not_before'] > 0) {
+                    $target = self::withRetryState($target, $state['attempts'], $state['not_before']);
+                }
             }
             @rename($claim, $target);
         }
