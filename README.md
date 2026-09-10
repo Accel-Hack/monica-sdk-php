@@ -53,40 +53,38 @@ requestを待って出られなくなるためです。`429` / `5xx` とネッ�
 残り、次のflushで送り直します。`401`はその1通を退けてflushを打ち切ります。
 `spool:flush` の出力の `rejected` がこれで、0 でなければ exit code は 1 です。
 
-`401` は 1 通の失敗ではなくキー自体の拒否なので、`transport.json` は `drop_and_stop`
-と定めています。**`401` を受けた transport は、以後 ingest へ POST しません**
+**`401` を受けた transport は、以後 ingest へ POST しません**
 （`Client::isStopped()` / transport の `isStopped()` で分かります）。以後の送信は
-requestを投げずに `401` を返すだけになります。PHPのprocessは短命なので、これは
-「そのprocess（HTTP request 1本、CLIなら1回の実行）の中では送らない」という意味です。
-次のrequestは新しいClientとtransportになるので、キーを直せばそのまま復帰します。
-`spool:flush` も同じで、`401` を受けた1通を `.rejected` へ退けてそのrunを打ち切り、
-残りは次のrunで送り直します。
+requestを投げずに `401` を返すだけになります。有効範囲はそのprocess
+（HTTP request 1本、CLIなら1回の実行）で、次のrequestは新しいClientとtransportに
+なるので、キーを直せば復帰します。`spool:flush` は `401` を受けた1通を `.rejected` へ
+退けてそのrunを打ち切り、残りは次のrunで送り直します。
 
-停止後に返る `401` はMONICAに問い合わせずに合成したものなので body を持ちません。
-`lastResponse()` の `status()` は `401` ですが、`errorCode()` / `errorMessage()` は
-`null`、`issues()` は空です（本物の `401` を受けた1回だけ、bodyがあれば code が入ります）。
+停止後に返る `401` は body を持ちません（`status()` は `401`、`errorCode()` /
+`errorMessage()` は `null`、`issues()` は空）。
 
-`422`（envelope schema 不正）は、拒否レスポンスの body（`error.json`）を読んで
-**既定で `error_log()` へ1行の警告を出します**。envelope のどのフィールドが拒否された
-かは `error.issues[].path` にあり、これはアプリ側で直せる唯一の失敗なので、黙って
-捨てると「いつからかeventが届かない」だけが残ります。`401`（キー自体が拒否され、
-以後そのprocessからは送らなくなる）も同じく1行出します。送らなくなったあとの
-envelopeについては出しません（同じ行が毎回出て埋もれるため、`401` を受けた1回だけ）。
+## 拒否の警告
+
+`422`（envelope schema 不正）は拒否レスポンスの body（`error.json`）を読み、
+**既定で `error_log()` へ1行の警告を出します**。拒否されたフィールドは
+`error.issues[].path` に出ます。`401` も1行出します（停止したあとの envelope に
+ついては出しません）。
 
 ```text
 monica: ingest rejected the envelope with 422 (invalid_envelope): 1 issue(s); $.items[0].request.method: Invalid type: Expected string
 monica: ingest rejected the envelope with 401 (invalid_key); no further envelopes will be sent
 ```
 
-書式は6つのSDKで揃えてあります。`error.code` が body から読めないときは `unknown`
-です。
+`error.code` が body から読めないときは `unknown` です。ログに出るのはMONICAが
+返した内容だけで、envelopeやAPIキーは含みません。
 
-出力先は `on_diagnostic` で差し替えられます（`callable` を渡すと
+出力先は `on_diagnostic` で差し替えられます。`callable` を渡すと
 `(string $message, \Monica\Transport\Response $response)` を受け取り、
-`false` / `null` で無効）。ログに出るのはMONICAが返した内容だけで、envelopeやAPIキーは
-含みません。プログラムから読む場合は `Client::lastResponse()`（`spool:flush` 経路は
+`false` / `null` で無効になります。`bin/monica` は STDERR に出します。
+
+プログラムから読む場合は `Client::lastResponse()`（`spool:flush` 経路は
 `SpoolFlusher::lastResponse()`）が `status()` / `errorCode()` / `errorMessage()` /
-`issues()` を持つ `Response` を返します。`flush()` の戻り値の意味は変わりません。
+`issues()` を持つ `Response` を返します。
 
 ```php
 if (!\Monica\Monica::flush()) {
@@ -98,9 +96,8 @@ if (!\Monica\Monica::flush()) {
 ```
 
 body が空・非JSON・`error.json` に適合しない・64 KiBを超える場合は、例外を投げずに
-issues無しの拒否として扱います。`400` などの他の4xxも body は読むので `Response` から
-`issues()` が取れますが、警告は出さず、破棄という扱いは変わりません（`429` は body を
-読みません）。`429` / `5xx` の再送も変わりません。
+issues無しの拒否として扱います。`400` などの他の4xxは警告を出しません（`429` は
+body を読みません）。
 
 DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
 送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
@@ -186,21 +183,16 @@ PHP だけ気付けない状態を作らないためです。schema を通るこ
 
 ### まだ実装していない契約
 
-`transport.json` のうち実装しているのは `endpoint` / `dsn` / `auth` と、
-`status`（status ごとの挙動）の一部です。`status` は `Monica\Transport\Outcome`
-が「受理 / 恒久失敗 / 再送可」の3つに分類し、spool の flusher がそれに従います。
-残っているのは次の2つです。
+`transport.json` のうち実装しているのは `endpoint` / `dsn` / `auth` と `status` の
+一部です。残っているのは次の2つです。
 
-- `retry`（`Retry-After`、backoff）には consumer がありません。再送は「次の flush で
-  もう一度送る」だけで、待ち時間もjitterも回数上限もありません。shutdown transport は
-  そもそも再送しないので、`429` / `5xx` の間の event は落ちます
+- `retry`（`Retry-After`、backoff、回数上限）。再送は次の flush で送り直すだけで、
+  待ち時間も回数上限もありません。`shutdown` は再送しません
 - `413` の `split_and_retry`。envelope の byte 上限（gzip 1 MiB / 展開後 8 MiB）での
-  分割が未実装なので、同じ byte を送り直しても `413` のままです。いまは恒久失敗として
-  扱っています。item 数 100 での分割はあります
+  分割が未実装で、恒久失敗として扱います。item 数 100 での分割はあります
 
-黙って取り残されないように、契約テストは `transport.json` の section 名と status の
-語彙、それに status ごとの分類そのものを固定しています。MONICA 側が section や status
-を増やすと、「この SDK が考慮していない契約が増えた」として落ちます。
+契約テストは `transport.json` の section 名、status の語彙、status ごとの分類を
+固定しています。
 
 ## Release
 
