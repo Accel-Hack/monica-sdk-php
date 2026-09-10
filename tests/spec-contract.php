@@ -40,6 +40,7 @@ use Monica\Transport\Dsn;
 use Monica\Transport\EnvelopeSplitter;
 use Monica\Transport\Outcome;
 use Monica\Transport\Response;
+use Monica\Transport\RetryPolicy;
 use Monica\Transport\TransportInterface;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Http\Client\ClientInterface;
@@ -667,18 +668,15 @@ expect(
     'transport.json should describe both a secret and a public key scheme'
 );
 
-// This SDK implements part of transport.json. `status` has a consumer for every
-// cell of the table now -- Outcome classifies a response, the spool flusher
-// acts on it, a 422's error.json body is read so its issues reach the caller,
-// and a 413 makes the transport split the envelope and post again. It stays
-// "partial" because 429's cell is `wait_retry_after` and nothing waits: that
-// belongs to `retry`, which still has no consumer at all:
-// nothing reads `Retry-After` or backs off. Pinning the vocabulary here turns
-// "MONICA grew an obligation the PHP SDK ignores" into a failing test instead of
-// a silent gap.
-$implemented = ['endpoint', 'dsn', 'auth'];
-$partiallyImplemented = ['status'];
-$unimplemented = ['retry'];
+// Every section of transport.json has a consumer now. `status` reaches the SDK
+// through Outcome and the spool flusher, a 422's error.json body is read so its
+// issues get out, a 413 makes the transport split the envelope and post again,
+// and `retry` is RetryPolicy plus the retry state the spool keeps per envelope.
+// Pinning the vocabulary here turns "MONICA grew an obligation the PHP SDK
+// ignores" into a failing test instead of a silent gap.
+$implemented = ['endpoint', 'dsn', 'auth', 'status', 'retry'];
+$partiallyImplemented = [];
+$unimplemented = [];
 $declared = array_keys($transportSpec);
 sort($declared, SORT_STRING);
 $accounted = array_merge($implemented, $partiallyImplemented, $unimplemented);
@@ -711,9 +709,9 @@ $sdkHandling = [
     'accept' => Outcome::ACCEPTED,
     'drop' => Outcome::REJECTED,
     'drop_and_stop' => Outcome::REJECTED_STOP,
-    // The retry *timing* is unimplemented, so both retry behaviours collapse
-    // into "try this envelope again on the next run" without honouring
-    // Retry-After or backing off.
+    // Both retry behaviours classify the same way; what separates them is the
+    // *timing*, which is RetryPolicy's business rather than Outcome's: a 429
+    // waits out Retry-After, a 5xx backs off.
     'wait_retry_after' => Outcome::RETRYABLE,
     'backoff' => Outcome::RETRYABLE,
     // A 413 refuses the bytes, not the content, so the same items can be
@@ -746,6 +744,68 @@ expect(
     $transportSpec['retry']['retry_on_network_error'] === true,
     'transport.json should still ask for network failures to be retried'
 );
+
+// The retry numbers are constants in the SDK for the same reason the byte caps
+// are: `spec/` is not shipped in the package, so there is nothing to read at
+// runtime. This is what keeps the copy honest.
+$retrySpec = $transportSpec['retry'];
+expect(
+    $retrySpec['retryable_statuses'] === ['429', '5xx'],
+    'transport.json changed which statuses are retryable: '
+    . implode(', ', $retrySpec['retryable_statuses'])
+);
+expect(
+    $retrySpec['retry_after']['integer_seconds_only'] === true,
+    'RetryPolicy::parseRetryAfter() only reads whole seconds, as the contract asks'
+);
+foreach ([
+    'retry_after.max_seconds' => [$retrySpec['retry_after']['max_seconds'], RetryPolicy::RETRY_AFTER_MAX_SECONDS],
+    'backoff.base_ms' => [$retrySpec['backoff']['base_ms'], RetryPolicy::BACKOFF_BASE_MS],
+    'backoff.factor' => [$retrySpec['backoff']['factor'], RetryPolicy::BACKOFF_FACTOR],
+    'backoff.max_ms' => [$retrySpec['backoff']['max_ms'], RetryPolicy::BACKOFF_MAX_MS],
+    'backoff.jitter_min' => [$retrySpec['backoff']['jitter_min'], RetryPolicy::JITTER_MIN],
+    'backoff.jitter_max' => [$retrySpec['backoff']['jitter_max'], RetryPolicy::JITTER_MAX],
+] as $name => $pair) {
+    expect(
+        (float) $pair[0] === (float) $pair[1],
+        'RetryPolicy must match transport.json on ' . $name . ': contract says '
+        . json_encode($pair[0]) . ', the SDK says ' . json_encode($pair[1])
+    );
+}
+
+// The contract only says there must be a limit, so the value is this SDK's
+// choice -- but there has to be one, or a doomed envelope is retried for ever.
+expect(
+    RetryPolicy::DEFAULT_MAX_ATTEMPTS >= 1,
+    'transport.json asks for a retry limit, so there must be a default'
+);
+$boundedPolicy = new RetryPolicy(3);
+expect(
+    $boundedPolicy->mayRetry(2) && !$boundedPolicy->mayRetry(3),
+    'the retry limit must actually stop an envelope'
+);
+// min(base * factor^attempt, max) with 50-100% jitter, read off the contract
+// rather than off the constants above.
+foreach ([1, 2, 3, 10] as $attempts) {
+    $unjittered = min(
+        $retrySpec['backoff']['base_ms'] * ($retrySpec['backoff']['factor'] ** ($attempts - 1)),
+        $retrySpec['backoff']['max_ms']
+    );
+    foreach ([0.0, 1.0] as $fraction) {
+        $policy = new RetryPolicy(RetryPolicy::DEFAULT_MAX_ATTEMPTS, static function () use ($fraction): float {
+            return $fraction;
+        });
+        $expected = (int) round($unjittered * (
+            $retrySpec['backoff']['jitter_min']
+            + $fraction * ($retrySpec['backoff']['jitter_max'] - $retrySpec['backoff']['jitter_min'])
+        ));
+        expect(
+            $policy->delayMilliseconds(null, $attempts) === $expected,
+            'attempt ' . $attempts . ' with jitter ' . $fraction . ' should wait '
+            . $expected . 'ms, not ' . $policy->delayMilliseconds(null, $attempts) . 'ms'
+        );
+    }
+}
 
 // The DSN path is not the ingest path. Sending to the DSN's trailing digits
 // would post to a project id that MONICA does not route on.

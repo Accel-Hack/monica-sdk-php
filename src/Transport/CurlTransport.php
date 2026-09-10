@@ -98,11 +98,25 @@ final class CurlTransport implements
             return $length;
         };
 
+        // Only one header is acted on, so only one is kept. Collecting them all
+        // would invite reading headers the contract says nothing about.
+        $retryAfter = null;
+        $readHeader = static function ($handle, string $line) use (&$retryAfter): int {
+            unset($handle);
+            $colon = strpos($line, ':');
+            if ($colon !== false && strcasecmp(substr($line, 0, $colon), 'Retry-After') === 0) {
+                $retryAfter = substr($line, $colon + 1);
+            }
+
+            return strlen($line);
+        };
+
         try {
             curl_setopt_array($handle, [
                 CURLOPT_POST => true,
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_WRITEFUNCTION => $collect,
+                CURLOPT_HEADERFUNCTION => $readHeader,
                 CURLOPT_HEADER => false,
                 CURLOPT_HTTPHEADER => [
                     'Authorization: Bearer ' . $this->dsn['key'],
@@ -123,7 +137,8 @@ final class CurlTransport implements
             $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
             $response = Response::forStatus(
                 $status,
-                $oversized || !Response::carriesDiagnostics($status) ? null : $responseBody
+                $oversized || !Response::carriesDiagnostics($status) ? null : $responseBody,
+                RetryPolicy::parseRetryAfter($retryAfter)
             );
             if ($response->outcome() === Outcome::REJECTED_STOP) {
                 $this->stopped = true;

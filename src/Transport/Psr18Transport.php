@@ -101,7 +101,10 @@ final class Psr18Transport implements
         $status = $response->getStatusCode();
         $result = Response::forStatus(
             $status,
-            Response::carriesDiagnostics($status) ? self::readBody($response) : null
+            Response::carriesDiagnostics($status) ? self::readBody($response) : null,
+            RetryPolicy::parseRetryAfter(
+                $response->hasHeader('Retry-After') ? $response->getHeaderLine('Retry-After') : null
+            )
         );
         if ($result->outcome() === Outcome::REJECTED_STOP) {
             $this->stopped = true;
@@ -118,8 +121,6 @@ final class Psr18Transport implements
      * reading. A PSR-7 body is a stream that may not be seekable or may not be
      * there at all, and none of that is worth failing a send over.
      *
-     * When `retry` lands, `Retry-After` is read from $response here and handed
-     * to `Response::forStatus()` alongside this.
      */
     private static function readBody(ResponseInterface $response): ?string
     {
