@@ -53,11 +53,21 @@ requestを待って出られなくなるためです。`429` / `5xx` とネッ�
 残り、次のflushで送り直します。`401`はその1通を退けてflushを打ち切ります。
 `spool:flush` の出力の `rejected` がこれで、0 でなければ exit code は 1 です。
 
+`401` は 1 通の失敗ではなくキー自体の拒否なので、`transport.json` は `drop_and_stop`
+と定めています。**`401` を受けた transport は、以後 ingest へ POST しません**
+（`Client::isStopped()` / transport の `isStopped()` で分かります）。以後の送信は
+requestを投げずに `401` を返すだけになります。PHPのprocessは短命なので、これは
+「そのprocess（HTTP request 1本、CLIなら1回の実行）の中では送らない」という意味です。
+次のrequestは新しいClientとtransportになるので、キーを直せばそのまま復帰します。
+`spool:flush` も同じで、`401` を受けた1通を `.rejected` へ退けてそのrunを打ち切り、
+残りは次のrunで送り直します。
+
 `422`（envelope schema 不正）は、拒否レスポンスの body（`error.json`）を読んで
 **既定で `error_log()` へ1行の警告を出します**。envelope のどのフィールドが拒否された
 かは `error.issues[].path` にあり、これはアプリ側で直せる唯一の失敗なので、黙って
 捨てると「いつからかeventが届かない」だけが残ります。`401`（キー自体が拒否され、
-その flush を打ち切る）も同じく1行出します。
+以後そのprocessからは送らなくなる）も同じく1行出します。送らなくなったあとの
+envelopeについては出しません（同じ行が毎回出て埋もれるため、`401` を受けた1回だけ）。
 
 ```text
 monica: ingest rejected the envelope with 422 (invalid_envelope): 1 issue(s); $.items[0].request.method: Invalid type: Expected string

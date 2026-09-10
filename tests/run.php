@@ -640,6 +640,7 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
         private $factory;
         public int $status = 202;
         public string $body = '';
+        public int $calls = 0;
 
         public function __construct(Psr17Factory $factory)
         {
@@ -649,6 +650,7 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
         public function sendRequest(RequestInterface $request): ResponseInterface
         {
             unset($request);
+            $this->calls++;
             $response = $this->factory->createResponse($this->status);
             if ($this->body === '') {
                 return $response;
@@ -764,8 +766,80 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
         'a throwing diagnostic handler should not change the outcome'
     );
 
+    // 401 is drop_and_stop: the key is refused, so the transport stops. Without
+    // the flag it kept posting the same key for every later envelope, which is
+    // what makes "no further envelopes will be sent" true rather than a wish.
+    $stopWarnings = [];
+    $stoppingTransport = new Psr18Transport(
+        'https://secret@ingest.example.test/1',
+        $stubClient,
+        $factory,
+        $factory,
+        new Diagnostics(static function (string $message) use (&$stopWarnings): void {
+            $stopWarnings[] = $message;
+        })
+    );
+    expect(!$stoppingTransport->isStopped(), 'a fresh transport should not be stopped');
+    $stubClient->status = 401;
+    $stubClient->body = '{"error":{"code":"invalid_key","message":"no"}}';
+    $stubClient->calls = 0;
+    expect(
+        $stoppingTransport->sendEnvelopeResponse($rejectionEnvelope, 2000)->outcome()
+        === Outcome::REJECTED_STOP,
+        'a 401 should be reported as REJECTED_STOP'
+    );
+    expect($stoppingTransport->isStopped(), 'a 401 should stop the transport');
+    // Whatever MONICA would answer now, the transport is not going to ask.
+    $stubClient->status = 202;
+    $stubClient->body = '';
+    $afterStop = $stoppingTransport->sendEnvelopeResponse($rejectionEnvelope, 2000);
+    expect($stubClient->calls === 1, 'a stopped transport should not send a request');
+    expect(
+        $afterStop->outcome() === Outcome::REJECTED_STOP && $afterStop->status() === 401,
+        'a stopped transport should keep answering 401 / REJECTED_STOP'
+    );
+    expect(
+        $afterStop->issues() === [],
+        'a short-circuited 401 has no body and so no issues'
+    );
+    expect(
+        count($stopWarnings) === 1,
+        'the 401 should be reported once, not once per dropped envelope: '
+        . json_encode($stopWarnings)
+    );
+    expect(!$stoppingTransport->send($rejectionEnvelope, 2000), 'send() should stay no');
+    expect($stubClient->calls === 1, 'send() on a stopped transport should not request either');
+
+    // ... and the client says so, instead of looking like MONICA went quiet.
+    $stubClient->status = 401;
+    $stubClient->body = '{"error":{"code":"invalid_key","message":"no"}}';
+    $stoppedClient = new Client([
+        'dsn' => 'https://secret@ingest.example.test/1',
+        'environment' => 'test',
+        'http_client' => $stubClient,
+        'request_factory' => $factory,
+        'stream_factory' => $factory,
+        'auto_capture' => false,
+        'on_diagnostic' => false,
+    ]);
+    expect(!$stoppedClient->isStopped(), 'a fresh client should not be stopped');
+    $stoppedClient->captureMessage('refused key');
+    expect(!$stoppedClient->flush(), 'a 401 should make flush() answer no');
+    expect($stoppedClient->isStopped(), 'a 401 should stop the client');
+    $stubClient->calls = 0;
+    $stubClient->status = 202;
+    $stubClient->body = '';
+    expect(!$stoppedClient->flush(), 'a stopped client should keep answering no');
+    expect($stubClient->calls === 0, 'a stopped client should not reach MONICA again');
+    expect(
+        $stoppedClient->lastResponse() !== null && $stoppedClient->lastResponse()->status() === 401,
+        'the last response should still say why the client stopped'
+    );
+
     // The spool path reaches ingest through the same transport, so a rejection
     // warns there too -- and the flusher exposes the response it acted on.
+    $stubClient->status = 422;
+    $stubClient->body = $rejectionBody;
     $spoolRejectDirectory = $spoolWith(1);
     $spoolWarnings = [];
     $spoolFlusher = new SpoolFlusher(
@@ -855,6 +929,43 @@ if (function_exists('curl_init') && function_exists('proc_open')) {
             );
             $assertCase('cURL', $case, $curlTransport->sendEnvelopeResponse($rejectionEnvelope, 5000), $warnings);
         }
+        // The same stop, on the transport that actually opens a socket.
+        expect(
+            file_put_contents($controlFile, (string) json_encode([
+                'status' => 401,
+                'body' => '{"error":{"code":"invalid_key","message":"no"}}',
+            ])) !== false,
+            'the test should be able to direct the stub server'
+        );
+        $curlStopWarnings = [];
+        $stoppingCurl = new CurlTransport(
+            'http://secret@127.0.0.1:' . $port . '/1',
+            new Diagnostics(static function (string $message) use (&$curlStopWarnings): void {
+                $curlStopWarnings[] = $message;
+            })
+        );
+        expect(!$stoppingCurl->isStopped(), 'a fresh cURL transport should not be stopped');
+        expect(
+            $stoppingCurl->sendEnvelopeResponse($rejectionEnvelope, 5000)->outcome()
+            === Outcome::REJECTED_STOP,
+            'cURL: a 401 should be reported as REJECTED_STOP'
+        );
+        expect($stoppingCurl->isStopped(), 'cURL: a 401 should stop the transport');
+        // The stub server would answer 202 now, so a 401 can only come from the
+        // transport refusing to ask.
+        expect(
+            file_put_contents($controlFile, (string) json_encode(['status' => 202, 'body' => ''])) !== false,
+            'the test should be able to direct the stub server'
+        );
+        $curlAfterStop = $stoppingCurl->sendEnvelopeResponse($rejectionEnvelope, 5000);
+        expect(
+            $curlAfterStop->status() === 401 && $curlAfterStop->outcome() === Outcome::REJECTED_STOP,
+            'cURL: a stopped transport should not send and should keep answering 401'
+        );
+        expect(
+            count($curlStopWarnings) === 1,
+            'cURL: the 401 should be reported once: ' . json_encode($curlStopWarnings)
+        );
     } finally {
         proc_terminate($server);
         proc_close($server);

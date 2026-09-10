@@ -11,7 +11,11 @@ use Psr\Http\Message\StreamFactoryInterface;
 use RuntimeException;
 use Throwable;
 
-final class Psr18Transport implements TransportInterface, OutcomeAwareInterface, ResponseAwareInterface
+final class Psr18Transport implements
+    TransportInterface,
+    OutcomeAwareInterface,
+    ResponseAwareInterface,
+    StoppableInterface
 {
     private ClientInterface $client;
     private RequestFactoryInterface $requestFactory;
@@ -19,6 +23,7 @@ final class Psr18Transport implements TransportInterface, OutcomeAwareInterface,
     /** @var array{endpoint: string, key: string} */
     private array $dsn;
     private Diagnostics $diagnostics;
+    private bool $stopped = false;
 
     public function __construct(
         string $dsn,
@@ -44,9 +49,26 @@ final class Psr18Transport implements TransportInterface, OutcomeAwareInterface,
         return $this->sendEnvelopeResponse($envelope, $timeoutMilliseconds)->outcome();
     }
 
+    /**
+     * Whether a 401 has stopped this transport. transport.json's
+     * `drop_and_stop` is about the key, not the envelope, so once MONICA
+     * refuses it there is nothing to gain from posting again.
+     */
+    public function isStopped(): bool
+    {
+        return $this->stopped;
+    }
+
     public function sendEnvelopeResponse(array $envelope, int $timeoutMilliseconds): Response
     {
         unset($timeoutMilliseconds);
+
+        if ($this->stopped) {
+            // The same answer MONICA gave, without asking again. Not reported:
+            // the 401 that stopped this transport was already reported once,
+            // and repeating it per dropped envelope would bury it.
+            return Response::forStatus(401);
+        }
 
         try {
             $json = json_encode(
@@ -69,6 +91,9 @@ final class Psr18Transport implements TransportInterface, OutcomeAwareInterface,
                 $status,
                 Response::carriesDiagnostics($status) ? self::readBody($response) : null
             );
+            if ($result->outcome() === Outcome::REJECTED_STOP) {
+                $this->stopped = true;
+            }
             // Reporting cannot throw, so this does not turn a rejection into
             // the network failure below.
             $this->diagnostics->report($result);

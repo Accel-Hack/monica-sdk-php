@@ -7,11 +7,16 @@ namespace Monica\Transport;
 use RuntimeException;
 use Throwable;
 
-final class CurlTransport implements TransportInterface, OutcomeAwareInterface, ResponseAwareInterface
+final class CurlTransport implements
+    TransportInterface,
+    OutcomeAwareInterface,
+    ResponseAwareInterface,
+    StoppableInterface
 {
     /** @var array{endpoint: string, key: string} */
     private array $dsn;
     private Diagnostics $diagnostics;
+    private bool $stopped = false;
 
     public function __construct(string $dsn, ?Diagnostics $diagnostics = null)
     {
@@ -29,8 +34,24 @@ final class CurlTransport implements TransportInterface, OutcomeAwareInterface, 
         return $this->sendEnvelopeResponse($envelope, $timeoutMilliseconds)->outcome();
     }
 
+    /**
+     * Whether a 401 has stopped this transport. transport.json's
+     * `drop_and_stop` is about the key, not the envelope, so once MONICA
+     * refuses it there is nothing to gain from posting again.
+     */
+    public function isStopped(): bool
+    {
+        return $this->stopped;
+    }
+
     public function sendEnvelopeResponse(array $envelope, int $timeoutMilliseconds): Response
     {
+        if ($this->stopped) {
+            // The same answer MONICA gave, without asking again. Not reported:
+            // the 401 that stopped this transport was already reported once,
+            // and repeating it per dropped envelope would bury it.
+            return Response::forStatus(401);
+        }
         if (!function_exists('curl_init')) {
             throw new RuntimeException('The cURL extension is required when no PSR-18 client is supplied');
         }
@@ -92,6 +113,9 @@ final class CurlTransport implements TransportInterface, OutcomeAwareInterface, 
                 $status,
                 $oversized || !Response::carriesDiagnostics($status) ? null : $body
             );
+            if ($response->outcome() === Outcome::REJECTED_STOP) {
+                $this->stopped = true;
+            }
             // Reporting cannot throw, so this does not fall through to the
             // network failure below.
             $this->diagnostics->report($response);

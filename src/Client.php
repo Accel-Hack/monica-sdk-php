@@ -13,6 +13,7 @@ use Monica\Transport\Psr18Transport;
 use Monica\Transport\Response;
 use Monica\Transport\ResponseAwareInterface;
 use Monica\Transport\SpoolTransport;
+use Monica\Transport\StoppableInterface;
 use Monica\Transport\TransportInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestFactoryInterface;
@@ -306,6 +307,19 @@ final class Client
     public function lastResponse(): ?Response
     {
         return $this->lastResponse;
+    }
+
+    /**
+     * Whether MONICA has refused the key. transport.json makes 401
+     * `drop_and_stop`, so the transport stops posting once it sees one and
+     * every later `flush()` answers no without a request.
+     *
+     * Always false in `spool` mode: the envelopes go to disk, and it is the
+     * flusher's transport that talks to MONICA.
+     */
+    public function isStopped(): bool
+    {
+        return $this->transport instanceof StoppableInterface && $this->transport->isStopped();
     }
 
     /**
