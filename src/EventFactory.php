@@ -232,7 +232,10 @@ final class EventFactory
             E_USER_ERROR => 'E_USER_ERROR',
             E_USER_WARNING => 'E_USER_WARNING',
             E_USER_NOTICE => 'E_USER_NOTICE',
-            E_STRICT => 'E_STRICT',
+            // E_STRICT の定数は 8.4 で deprecated になり、その error level も
+            // 削除された。定数を書くとこの表を引くたびに deprecation が出るので
+            // 値で書く。7.4 では E_STRICT はまだ上がるので、対応は落とさない。
+            2048 => 'E_STRICT',
             E_RECOVERABLE_ERROR => 'E_RECOVERABLE_ERROR',
             E_DEPRECATED => 'E_DEPRECATED',
             E_USER_DEPRECATED => 'E_USER_DEPRECATED',

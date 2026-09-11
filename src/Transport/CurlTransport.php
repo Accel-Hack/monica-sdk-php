@@ -151,7 +151,13 @@ final class CurlTransport implements
         } catch (Throwable $ignored) {
             return Response::forNetworkFailure();
         } finally {
-            curl_close($handle);
+            // 8.0 で handle が resource から object になり、GC が解放するように
+            // なった。curl_close はそこから何もしない関数になり、8.5 で
+            // deprecated になっている。7.4 では resource のままで、ここで閉じ
+            // ないと解放されないので、resource のときだけ呼ぶ。
+            if (is_resource($handle)) {
+                curl_close($handle);
+            }
         }
     }
 }
