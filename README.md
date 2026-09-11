@@ -47,11 +47,13 @@ SAPIにしか無く、mod_phpにはコネクションを切り離す手段がな
 応答しないとクライアントの待ち時間が`request_timeout_ms`（既定2000ms）の分だけ
 伸びるので、**この構成では`spool`を使ってください**。CLI/batchと同じ理由です。
 
-MONICA が恒久的に拒否した envelope（`400` / `422` / `413`）は spool に残さず、
+MONICA が恒久的に拒否した envelope（`400` / `422`）は spool に残さず、
 `.rejected` を付けて脇に退けます。残すと後続の envelope が、決して成功しない
 requestを待って出られなくなるためです。`429` / `5xx` とネットワーク障害はspoolに
-残り、次のflushで送り直します。`401`はその1通を退けてflushを打ち切ります。
-`spool:flush` の出力の `rejected` がこれで、0 でなければ exit code は 1 です。
+残り、待ち時間が過ぎてから送り直します（[再送](#再送retry)）。`401`はその1通を
+退けてflushを打ち切ります。`413` は transport が envelope を割って送り直します
+（[envelopeの分割](#envelopeの分割)）。`spool:flush` の出力の `rejected` が
+退けた数で、0 でなければ exit code は 1 です。
 
 **`401` を受けた transport は、以後 ingest へ POST しません**
 （`Client::isStopped()` / transport の `isStopped()` で分かります）。以後の送信は
@@ -115,6 +117,57 @@ monica: dropped 1 item(s) that cannot fit one envelope (1234567 gzip bytes, limi
 
 byte 上限は `Monica\Transport\EnvelopeSplitter::MAX_GZIP_BYTES` /
 `MAX_DECOMPRESSED_BYTES` の定数です。
+
+## 再送（retry）
+
+再送するのは `429` / `5xx` とネットワーク障害だけで、他の 4xx は恒久的な失敗です。
+
+- `429` は `Retry-After` の秒数だけ待ちます。整数秒だけを解釈し（HTTP-date は
+  backoffに落とします）、上限は60秒で、超える値は丸めます
+- それ以外は `min(1000 * 2^(attempt-1), 30000)` ms に 50〜100% の jitter です
+- attempt が上限（既定5回、`SpoolFlusher` の第4引数 `RetryPolicy` で変更可）に
+  達したら envelope を捨て、警告を出します
+
+```text
+monica: giving up on a spooled envelope after 5 attempt(s); 3 event(s) are lost
+```
+
+待ち時間は `sleep()` で消費せず、attempt 回数と「この時刻まで送らない」を spool の
+ファイル名（`…--try2-at1757500000.json`）に持ちます。待ち時間中の envelope は
+`spool:flush` の出力の `deferred` に出ます。`sent=0 failed=0 deferred=3` は「MONICA が
+応答しない」ではなく「まだ時刻ではない」という意味で、exit code は 0 です。
+
+**待ち時間は次の flush が拾うので、`spool:flush` は定期実行してください。**
+1回しか実行しない運用だと、待ち時間に入った envelope はそのrunでは送られません。
+間隔は 1 分程度が扱いやすいです。同時に複数走っても問題ありません。
+
+```cron
+* * * * * /usr/bin/php /srv/app/vendor/bin/monica spool:flush >> /var/log/monica-spool.log 2>&1
+```
+
+systemd timer なら次のようになります（`MONICA_DSN` は `Environment=` か
+`EnvironmentFile=` で渡します）。
+
+```ini
+# monica-spool.service
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/monica.env
+ExecStart=/usr/bin/php /srv/app/vendor/bin/monica spool:flush
+
+# monica-spool.timer
+[Timer]
+OnUnitActiveSec=1min
+AccuracySec=1s
+```
+
+警告（`422` の issues、`401`、諦めた envelope）は STDERR に出るので、上の例のように
+ログへ落としてください。
+
+**直接送信（`shutdown`）は再送しません。** `flush()` が false を返した event は queue に
+残り、同じ process の中で次に `flush()` が呼ばれたときに送り直すだけで、process が
+終われば失われます。**`429` / `5xx` の間の event を落としたくない場合は `spool` を
+使ってください。**
 
 DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
 送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
@@ -198,16 +251,15 @@ PHP だけ気付けない状態を作らないためです。schema を通るこ
 4 は `ingest.md` の散文から定数を写すのではなく、`transport.json` を読んで
 突き合わせます。だから MONICA 側が endpoint やヘッダを変えると、ここが落ちます。
 
-### まだ実装していない契約
+### transport.json の実装状況
 
-`transport.json` のうち実装しているのは `endpoint` / `dsn` / `auth` と `status` です。
-`413` は transport が envelope を分割して送り直します（[envelopeの分割](#envelopeの分割)）。
-残っているのは次の1つです。
+`endpoint` / `dsn` / `auth` / `status` / `retry` の全 section を実装しています。
 
-- `retry`（`Retry-After`、backoff、回数上限）。再送は次の flush で送り直すだけで、
-  待ち時間も回数上限もありません。`shutdown` は再送しません
+意図的な乖離が1つあります。**直接送信（`shutdown`）は再送しません。**
+`429` / `5xx` を落としたくない場合は `spool` を使ってください。
 
-契約テストは `transport.json` の section 名、status の語彙、status ごとの分類を
+契約テストは `transport.json` の section 名、status の語彙、status ごとの分類、
+`retry` の定数（`Retry-After` の上限、backoff の base / factor / max / jitter）を
 固定しています。
 
 ## Release

@@ -16,11 +16,9 @@ namespace Monica\Transport;
  * Nothing here changes what happens to an envelope. A rejection is still a
  * rejection; it is merely no longer silent.
  *
- * The response headers are deliberately not part of this yet. `Retry-After` is
- * the one that matters and it belongs to `retry`, which has no consumer (see
- * README): it arrives here as another optional argument to `forStatus()` and
- * another accessor, so a transport that starts collecting headers does not
- * change any of the shapes above.
+ * `Retry-After` is the one response header the SDK acts on, so it is carried
+ * here as a number of seconds rather than as a header bag: the rest of the
+ * headers are MONICA's business, and a bag would invite reading them.
  */
 final class Response
 {
@@ -42,6 +40,7 @@ final class Response
     private int $droppedItems = 0;
     /** @var list<int> */
     private array $droppedItemIndexes = [];
+    private ?int $retryAfterSeconds;
 
     /**
      * @param list<array{path: string, message: string}> $issues
@@ -51,29 +50,43 @@ final class Response
         ?int $status,
         ?string $errorCode,
         ?string $errorMessage,
-        array $issues
+        array $issues,
+        ?int $retryAfterSeconds = null
     ) {
         $this->outcome = $outcome;
         $this->status = $status;
         $this->errorCode = $errorCode;
         $this->errorMessage = $errorMessage;
         $this->issues = $issues;
+        $this->retryAfterSeconds = $retryAfterSeconds;
     }
 
     /**
-     * @param string|null $body the response body, or null when it was not read
-     *                          or exceeded MAX_BODY_BYTES
+     * @param string|null $body               the response body, or null when it was not
+     *                                        read or exceeded MAX_BODY_BYTES
+     * @param int|null    $retryAfterSeconds  `Retry-After` as whole seconds, already
+     *                                        clamped by RetryPolicy::parseRetryAfter()
      */
-    public static function forStatus(int $status, ?string $body = null): self
-    {
+    public static function forStatus(
+        int $status,
+        ?string $body = null,
+        ?int $retryAfterSeconds = null
+    ): self {
         $outcome = Outcome::forStatus($status);
         if ($body === null || $body === '' || !self::carriesDiagnostics($status)) {
-            return new self($outcome, $status, null, null, []);
+            return new self($outcome, $status, null, null, [], $retryAfterSeconds);
         }
 
         $error = self::parse($body);
 
-        return new self($outcome, $status, $error['code'], $error['message'], $error['issues']);
+        return new self(
+            $outcome,
+            $status,
+            $error['code'],
+            $error['message'],
+            $error['issues'],
+            $retryAfterSeconds
+        );
     }
 
     /**
@@ -147,6 +160,16 @@ final class Response
     public function droppedItemIndexes(): array
     {
         return $this->droppedItemIndexes;
+    }
+
+    /**
+     * `Retry-After` in whole seconds, or null when MONICA did not send a usable
+     * one (including the HTTP-date form, which is not interpreted). Only 429
+     * and 5xx carry it in practice.
+     */
+    public function retryAfterSeconds(): ?int
+    {
+        return $this->retryAfterSeconds;
     }
 
     /** One of the Outcome constants. */

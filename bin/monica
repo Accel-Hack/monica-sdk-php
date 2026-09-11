@@ -91,11 +91,12 @@ if ($command === 'spool:flush') {
     fwrite(
         STDOUT,
         sprintf(
-            "MONICA spool: sent=%d failed=%d rejected=%d invalid=%d\n",
+            "MONICA spool: sent=%d failed=%d rejected=%d invalid=%d deferred=%d\n",
             $result['sent'],
             $result['failed'],
             $result['rejected'],
-            $result['invalid']
+            $result['invalid'],
+            $result['deferred']
         )
     );
     exit(

@@ -147,6 +147,7 @@ jobs:
               Monica\Transport\Response::class,
               Monica\Transport\Diagnostics::class,
               Monica\Transport\EnvelopeSplitter::class,
+              Monica\Transport\RetryPolicy::class,
             ] as $class) {
               if (!class_exists($class)) {
                 fwrite(STDERR, $class . " is not autoloadable from the published package\n");

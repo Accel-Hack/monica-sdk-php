@@ -12,6 +12,8 @@ use Monica\Transport\Outcome;
 use Monica\Transport\OutcomeAwareInterface;
 use Monica\Transport\Psr18Transport;
 use Monica\Transport\Response;
+use Monica\Transport\ResponseAwareInterface;
+use Monica\Transport\RetryPolicy;
 use Monica\Transport\SpoolFlusher;
 use Monica\Transport\SpoolTransport;
 use Monica\Transport\TransportInterface;
@@ -196,7 +198,7 @@ expect(touch($staleClaim, time() - 120), 'the test should make the claim stale')
 $receiver = new RecordingTransport();
 $result = (new SpoolFlusher($spoolDirectory, $receiver, 60))->flush();
 expect(
-    $result === ['sent' => 1, 'failed' => 0, 'rejected' => 0, 'invalid' => 0],
+    $result === ['sent' => 1, 'failed' => 0, 'rejected' => 0, 'invalid' => 0, 'deferred' => 0],
     'spool should flush'
 );
 expect(count($receiver->envelopes) === 1, 'a stale spool claim should be recovered and sent');
@@ -228,7 +230,7 @@ $rejectDirectory = $spoolWith(2);
 $rejecting = new OutcomeTransport([Outcome::REJECTED]);
 $rejectResult = (new SpoolFlusher($rejectDirectory, $rejecting, 60))->flush();
 expect(
-    $rejectResult === ['sent' => 1, 'failed' => 0, 'rejected' => 1, 'invalid' => 0],
+    $rejectResult === ['sent' => 1, 'failed' => 0, 'rejected' => 1, 'invalid' => 0, 'deferred' => 0],
     'a rejected envelope should be counted and the run should continue: '
     . json_encode($rejectResult)
 );
@@ -246,7 +248,7 @@ $retryDirectory = $spoolWith(2);
 $retrying = new OutcomeTransport([Outcome::RETRYABLE]);
 $retryResult = (new SpoolFlusher($retryDirectory, $retrying, 60))->flush();
 expect(
-    $retryResult === ['sent' => 0, 'failed' => 1, 'rejected' => 0, 'invalid' => 0],
+    $retryResult === ['sent' => 0, 'failed' => 1, 'rejected' => 0, 'invalid' => 0, 'deferred' => 0],
     'a retryable failure should be counted as failed: ' . json_encode($retryResult)
 );
 expect(count($retrying->envelopes) === 1, 'a retryable failure should stop the run');
@@ -262,7 +264,7 @@ $stopDirectory = $spoolWith(2);
 $stopping = new OutcomeTransport([Outcome::REJECTED_STOP]);
 $stopResult = (new SpoolFlusher($stopDirectory, $stopping, 60))->flush();
 expect(
-    $stopResult === ['sent' => 0, 'failed' => 0, 'rejected' => 1, 'invalid' => 0],
+    $stopResult === ['sent' => 0, 'failed' => 0, 'rejected' => 1, 'invalid' => 0, 'deferred' => 0],
     'a refused key should be counted as rejected: ' . json_encode($stopResult)
 );
 expect(count($stopping->envelopes) === 1, 'a refused key should stop the run');
@@ -347,7 +349,7 @@ $legacyReceiver = new RecordingTransport();
 $legacyReceiver->accepted = false;
 $legacyResult = (new SpoolFlusher($legacyDirectory, $legacyReceiver, 60))->flush();
 expect(
-    $legacyResult === ['sent' => 0, 'failed' => 1, 'rejected' => 0, 'invalid' => 0],
+    $legacyResult === ['sent' => 0, 'failed' => 1, 'rejected' => 0, 'invalid' => 0, 'deferred' => 0],
     'a bool-only transport saying no should still mean retryable: ' . json_encode($legacyResult)
 );
 expect(count(glob($legacyDirectory . '/*.json') ?: []) === 1, 'the envelope should stay in the spool');
@@ -561,6 +563,8 @@ $diagnosticCases = [
         'label' => '429',
         'status' => 429,
         'body' => $rejectionBody,
+        'retry_after' => '30',
+        'retry_after_seconds' => 30,
         'outcome' => Outcome::RETRYABLE,
         'code' => null,
         'message' => null,
@@ -572,6 +576,10 @@ $diagnosticCases = [
         'label' => '503',
         'status' => 503,
         'body' => $rejectionBody,
+        // Legal HTTP, but not whole seconds: the SDK backs off instead of
+        // trusting its own clock against the server's.
+        'retry_after' => 'Wed, 21 Oct 2015 07:28:00 GMT',
+        'retry_after_seconds' => null,
         'outcome' => Outcome::RETRYABLE,
         'code' => null,
         'message' => null,
@@ -609,6 +617,10 @@ $assertCase = static function (
         $where . 'expected outcome ' . $case['outcome'] . ', got ' . $response->outcome()
     );
     expect($response->errorCode() === $case['code'], $where . 'unexpected error code');
+    expect(
+        $response->retryAfterSeconds() === ($case['retry_after_seconds'] ?? null),
+        $where . 'unexpected Retry-After: ' . json_encode($response->retryAfterSeconds())
+    );
     expect($response->errorMessage() === $case['message'], $where . 'unexpected error message');
     expect(
         $response->issues() === $case['issues'],
@@ -641,6 +653,7 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
         private $factory;
         public int $status = 202;
         public string $body = '';
+        public string $retryAfter = '';
         public int $calls = 0;
 
         public function __construct(Psr17Factory $factory)
@@ -653,6 +666,9 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
             unset($request);
             $this->calls++;
             $response = $this->factory->createResponse($this->status);
+            if ($this->retryAfter !== '') {
+                $response = $response->withHeader('Retry-After', $this->retryAfter);
+            }
             if ($this->body === '') {
                 return $response;
             }
@@ -664,6 +680,7 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
     foreach ($diagnosticCases as $case) {
         $stubClient->status = $case['status'];
         $stubClient->body = str_repeat($case['body'], $case['repeat'] ?? 1);
+        $stubClient->retryAfter = (string) ($case['retry_after'] ?? '');
         $warnings = [];
         $transport = new Psr18Transport(
             'https://secret@ingest.example.test/1',
@@ -767,6 +784,8 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
         'a throwing diagnostic handler should not change the outcome'
     );
 
+    $stubClient->retryAfter = '';
+
     // 401 is drop_and_stop: the key is refused, so the transport stops. Without
     // the flag it kept posting the same key for every later envelope, which is
     // what makes "no further envelopes will be sent" true rather than a wish.
@@ -861,7 +880,7 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
     );
     $spoolRejectResult = $spoolFlusher->flush();
     expect(
-        $spoolRejectResult === ['sent' => 0, 'failed' => 0, 'rejected' => 1, 'invalid' => 0],
+        $spoolRejectResult === ['sent' => 0, 'failed' => 0, 'rejected' => 1, 'invalid' => 0, 'deferred' => 0],
         'a 422 should still retire the spooled envelope: ' . json_encode($spoolRejectResult)
     );
     expect(
@@ -876,6 +895,254 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
     );
     $discardSpool($spoolRejectDirectory);
 }
+
+// --- retry: Retry-After, backoff, and a limit ------------------------------
+//
+// The waiting is not done by sleeping: the spool keeps how many attempts an
+// envelope has had and the earliest instant it may be sent again, in the file
+// name, so the wait survives the process that failed.
+
+expect(RetryPolicy::parseRetryAfter('30') === 30, 'Retry-After in seconds should be read');
+expect(RetryPolicy::parseRetryAfter('  7 ') === 7, 'Retry-After should tolerate surrounding space');
+expect(RetryPolicy::parseRetryAfter('0') === 0, 'Retry-After: 0 means now, not nothing');
+expect(
+    RetryPolicy::parseRetryAfter('600') === RetryPolicy::RETRY_AFTER_MAX_SECONDS,
+    'a Retry-After over the cap should be clamped to it'
+);
+foreach ([
+    'Wed, 21 Oct 2015 07:28:00 GMT',
+    '',
+    '-5',
+    '1.5',
+    'soon',
+] as $unusable) {
+    expect(
+        RetryPolicy::parseRetryAfter($unusable) === null,
+        'Retry-After "' . $unusable . '" is not whole seconds and should fall back to the backoff'
+    );
+}
+expect(RetryPolicy::parseRetryAfter(null) === null, 'a missing Retry-After should be null');
+
+// Retry-After wins over the backoff: it is the server saying when it will be
+// ready, which no backoff can guess.
+$halfJitter = new RetryPolicy(RetryPolicy::DEFAULT_MAX_ATTEMPTS, static function (): float {
+    return 0.0;
+});
+expect(
+    $halfJitter->delayMilliseconds(Response::forStatus(429, null, 12), 4) === 12000,
+    'Retry-After should be honoured instead of the backoff'
+);
+expect(
+    $halfJitter->delayMilliseconds(Response::forStatus(503), 1) === 500,
+    'the first backoff with the lowest jitter should be 500ms, got '
+    . $halfJitter->delayMilliseconds(Response::forStatus(503), 1) . 'ms'
+);
+$fullJitter = new RetryPolicy(RetryPolicy::DEFAULT_MAX_ATTEMPTS, static function (): float {
+    return 1.0;
+});
+expect(
+    $fullJitter->delayMilliseconds(null, 1) === 1000,
+    'the first backoff with full jitter should be the base delay'
+);
+expect(
+    $fullJitter->delayMilliseconds(null, 99) === RetryPolicy::BACKOFF_MAX_MS,
+    'the backoff should stop growing at the published maximum'
+);
+
+/**
+ * A transport that answers with a whole Response, so the flusher can be driven
+ * through Retry-After and the retry limit.
+ */
+final class RespondingTransport implements TransportInterface, OutcomeAwareInterface, ResponseAwareInterface
+{
+    /** @var list<array<string, mixed>> */
+    public array $envelopes = [];
+    public Response $response;
+
+    public function __construct(Response $response)
+    {
+        $this->response = $response;
+    }
+
+    public function send(array $envelope, int $timeoutMilliseconds): bool
+    {
+        return $this->sendEnvelope($envelope, $timeoutMilliseconds) === Outcome::ACCEPTED;
+    }
+
+    public function sendEnvelope(array $envelope, int $timeoutMilliseconds): string
+    {
+        return $this->sendEnvelopeResponse($envelope, $timeoutMilliseconds)->outcome();
+    }
+
+    public function sendEnvelopeResponse(array $envelope, int $timeoutMilliseconds): Response
+    {
+        unset($timeoutMilliseconds);
+        $this->envelopes[] = $envelope;
+
+        return $this->response;
+    }
+}
+
+$markerOf = static function (string $directory): ?array {
+    foreach (glob($directory . DIRECTORY_SEPARATOR . '*.json') ?: [] as $file) {
+        if (preg_match('/--try([0-9]+)-at([0-9]+)\.json$/', basename($file), $matches) === 1) {
+            return ['attempts' => (int) $matches[1], 'not_before' => (int) $matches[2], 'path' => $file];
+        }
+    }
+
+    return null;
+};
+
+// A 429 with Retry-After: the envelope waits exactly that long, and the wait is
+// recorded where the next process can see it.
+$waitDirectory = $spoolWith(1);
+// The 14 digits the spool orders by, before any retry touches the name.
+$waitCreatedAt = substr(basename((glob($waitDirectory . '/*.json') ?: [''])[0]), 0, 14);
+expect(
+    preg_match('/^[0-9]{14}$/', $waitCreatedAt) === 1,
+    'a spooled file should start with its creation time: ' . $waitCreatedAt
+);
+$waiting = new RespondingTransport(Response::forStatus(429, null, 30));
+$waitFlusher = new SpoolFlusher($waitDirectory, $waiting, 60);
+$waitResult = $waitFlusher->flush();
+expect(
+    $waitResult === ['sent' => 0, 'failed' => 1, 'rejected' => 0, 'invalid' => 0, 'deferred' => 0],
+    'a 429 should be counted as failed: ' . json_encode($waitResult)
+);
+$waitMarker = $markerOf($waitDirectory);
+expect($waitMarker !== null, 'the retry state should be recorded in the file name');
+expect($waitMarker['attempts'] === 1, 'the first failure should be the first attempt');
+expect(
+    $waitMarker['not_before'] >= time() + 29 && $waitMarker['not_before'] <= time() + 31,
+    'Retry-After: 30 should hold the envelope for 30 seconds, not '
+    . ($waitMarker['not_before'] - time())
+);
+// The creation time the spool orders by has to survive the rename, or pruning
+// would start dropping the wrong files.
+expect(
+    strpos(basename($waitMarker['path']), $waitCreatedAt . '-') === 0,
+    'a retried file should keep the creation time it was written with ('
+    . $waitCreatedAt . '): ' . basename($waitMarker['path'])
+);
+
+// The next flush leaves it alone: sending now is what MONICA asked the SDK not
+// to do. `deferred` is how that is told apart from a failure.
+$deferredResult = (new SpoolFlusher($waitDirectory, $waiting, 60))->flush();
+expect(
+    $deferredResult === ['sent' => 0, 'failed' => 0, 'rejected' => 0, 'invalid' => 0, 'deferred' => 1],
+    'an envelope still inside its Retry-After should be deferred: ' . json_encode($deferredResult)
+);
+expect(count($waiting->envelopes) === 1, 'a deferred envelope should not be sent');
+
+// Once the wait has passed, an ordinary flush picks it up -- attempts and all.
+$due = preg_replace('/-at[0-9]+\.json$/', '-at1.json', $waitMarker['path']);
+expect(rename($waitMarker['path'], (string) $due), 'the test should be able to make the wait elapse');
+$acceptingAfterWait = new RespondingTransport(Response::forStatus(202));
+$afterWaitResult = (new SpoolFlusher($waitDirectory, $acceptingAfterWait, 60))->flush();
+expect(
+    $afterWaitResult === ['sent' => 1, 'failed' => 0, 'rejected' => 0, 'invalid' => 0, 'deferred' => 0],
+    'an envelope past its wait should be sent: ' . json_encode($afterWaitResult)
+);
+expect(count(glob($waitDirectory . '/*.json') ?: []) === 0, 'the sent envelope should leave the spool');
+$discardSpool($waitDirectory);
+
+// Attempts are counted across processes, because the process that failed is
+// usually gone by the time the next attempt is due. Each flush here is a
+// separate flusher, and Retry-After: 0 makes the envelope due immediately.
+$countDirectory = $spoolWith(1);
+$immediate = new RespondingTransport(Response::forStatus(503, null, 0));
+$giveUpWarnings = [];
+$boundedFlush = static function () use ($countDirectory, $immediate, &$giveUpWarnings): array {
+    return (new SpoolFlusher(
+        $countDirectory,
+        $immediate,
+        60,
+        new RetryPolicy(3),
+        new Diagnostics(static function (string $message) use (&$giveUpWarnings): void {
+            $giveUpWarnings[] = $message;
+        })
+    ))->flush();
+};
+$boundedFlush();
+expect($markerOf($countDirectory)['attempts'] === 1, 'the first failure should count as one attempt');
+$boundedFlush();
+expect(
+    $markerOf($countDirectory)['attempts'] === 2,
+    'a new process should carry on counting from the file, not from zero'
+);
+$exhausted = $boundedFlush();
+expect(
+    $exhausted === ['sent' => 0, 'failed' => 0, 'rejected' => 1, 'invalid' => 0, 'deferred' => 0],
+    'the third attempt of three should give up on the envelope: ' . json_encode($exhausted)
+);
+expect(count($immediate->envelopes) === 3, 'the envelope should have been tried exactly three times');
+expect(
+    count(glob($countDirectory . '/*.json') ?: []) === 0,
+    'an envelope that ran out of attempts should not stay in the spool'
+);
+expect(
+    count(glob($countDirectory . '/.sending-*.rejected') ?: []) === 1,
+    'a given-up envelope should be retired like any other undeliverable one'
+);
+expect(
+    count($giveUpWarnings) === 1 && strpos($giveUpWarnings[0], 'monica: giving up') === 0,
+    'giving up on an envelope should be reported: ' . json_encode($giveUpWarnings)
+);
+$discardSpool($countDirectory);
+
+// A stale claim on a file that already carries retry state has to come back
+// with that state intact.
+$recoverDirectory = $spoolWith(1);
+$recoverFile = (glob($recoverDirectory . '/*.json') ?: [])[0];
+$withState = preg_replace('/\.json$/', '--try2-at1.json', $recoverFile);
+expect(rename($recoverFile, (string) $withState), 'the test should be able to add retry state');
+$recoverClaim = $recoverDirectory . DIRECTORY_SEPARATOR . '.sending-999-' . basename((string) $withState);
+expect(rename((string) $withState, $recoverClaim), 'the test should be able to claim the file');
+expect(touch($recoverClaim, time() - 600), 'the test should be able to make the claim stale');
+$recovering = new RespondingTransport(Response::forStatus(503, null, 0));
+(new SpoolFlusher($recoverDirectory, $recovering, 60, new RetryPolicy(5)))->flush();
+expect(
+    $markerOf($recoverDirectory)['attempts'] === 3,
+    'a recovered claim should keep counting from the attempts it already had'
+);
+$discardSpool($recoverDirectory);
+
+// ... and when its old name is already taken, the recovered file gets a new
+// name but keeps the history: losing the marker here would set its attempts
+// back to zero and start the backoff again.
+$collideDirectory = $spoolWith(1);
+$collideFile = (glob($collideDirectory . '/*.json') ?: [])[0];
+$collideName = (string) preg_replace('/\.json$/', '--try2-at1.json', basename($collideFile));
+expect(
+    rename($collideFile, $collideDirectory . DIRECTORY_SEPARATOR . $collideName),
+    'the test should be able to add retry state'
+);
+// A stale claim on that same name, with the file still in place: recovering it
+// cannot use its original name, which is the collision under test.
+$collideClaim = $collideDirectory . DIRECTORY_SEPARATOR . '.sending-999-' . $collideName;
+expect(
+    copy($collideDirectory . DIRECTORY_SEPARATOR . $collideName, $collideClaim),
+    'the test should be able to leave a stale claim behind'
+);
+expect(touch($collideClaim, time() - 600), 'the test should be able to make the claim stale');
+$collideTransport = new RespondingTransport(Response::forStatus(503, null, 0));
+(new SpoolFlusher($collideDirectory, $collideTransport, 60, new RetryPolicy(5)))->flush();
+$collideMarkers = [];
+foreach (glob($collideDirectory . '/*.json') ?: [] as $file) {
+    $collideMarkers[] = preg_match('/--try([0-9]+)-at([0-9]+)\.json$/', basename($file), $matches) === 1
+        ? (int) $matches[1]
+        : 0;
+}
+sort($collideMarkers);
+// One of the two was sent and failed again (2 -> 3); the other is the recovered
+// file, still at the 2 attempts its name carried. A 0 here means the recovery
+// threw the history away.
+expect(
+    $collideMarkers === [2, 3],
+    'a recovered claim renamed around a collision should keep its attempts, got '
+    . json_encode($collideMarkers)
+);
+$discardSpool($collideDirectory);
 
 // --- 413: splitting an envelope on the byte limits -------------------------
 //
@@ -1235,6 +1502,7 @@ if (function_exists('curl_init') && function_exists('proc_open')) {
                     'status' => $case['status'],
                     'body' => $case['body'],
                     'repeat' => $case['repeat'] ?? 1,
+                    'retry_after' => $case['retry_after'] ?? null,
                 ])) !== false,
                 'the test should be able to direct the stub server'
             );

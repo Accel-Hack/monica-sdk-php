@@ -14,7 +14,8 @@ declare(strict_types=1);
  *     {"status": 422, "body": "{\"error\":{...}}"}
  *
  * `repeat` multiplies the body, so an oversized response does not need an
- * oversized file to describe it.
+ * oversized file to describe it. `retry_after` sets the header of that name,
+ * and `max_items` answers 413 for anything bigger.
  *
  * Every request is appended to `MONICA_STUB_LOG` as one JSON line, so a test
  * can assert on what actually arrived -- that the body is gzipped, and which
@@ -75,4 +76,7 @@ if (isset($directive['max_items']) && is_array($envelope) && isset($envelope['it
 
 http_response_code($status);
 header('Content-Type: application/json');
+if (isset($directive['retry_after'])) {
+    header('Retry-After: ' . (string) $directive['retry_after']);
+}
 echo str_repeat($body, $repeat);

@@ -23,7 +23,7 @@ use Throwable;
 final class Client
 {
     public const SDK_NAME = 'ah-monica/monica';
-    public const SDK_VERSION = '0.1.1';
+    public const SDK_VERSION = '0.2.0';
 
     private EventFactory $eventFactory;
     private TransportInterface $transport;
