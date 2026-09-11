@@ -144,9 +144,22 @@ jobs:
               Monica\Transport\SpoolTransport::class,
               Monica\Transport\SpoolFlusher::class,
               Monica\Transport\Dsn::class,
+              Monica\Transport\Response::class,
+              Monica\Transport\Diagnostics::class,
             ] as $class) {
               if (!class_exists($class)) {
                 fwrite(STDERR, $class . " is not autoloadable from the published package\n");
+                exit(1);
+              }
+            }
+            foreach ([
+              Monica\Transport\TransportInterface::class,
+              Monica\Transport\OutcomeAwareInterface::class,
+              Monica\Transport\ResponseAwareInterface::class,
+              Monica\Transport\StoppableInterface::class,
+            ] as $interface) {
+              if (!interface_exists($interface)) {
+                fwrite(STDERR, $interface . " is not autoloadable from the published package\n");
                 exit(1);
               }
             }

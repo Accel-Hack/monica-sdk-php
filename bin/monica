@@ -5,6 +5,7 @@ declare(strict_types=1);
 
 use Monica\Client;
 use Monica\Transport\CurlTransport;
+use Monica\Transport\Diagnostics;
 use Monica\Transport\SpoolFlusher;
 
 $autoload = isset($GLOBALS['_composer_autoload_path'])
@@ -15,6 +16,13 @@ if (!is_file($autoload)) {
     exit(2);
 }
 require $autoload;
+
+// Both commands run on a terminal or under cron, and the point of a warning is
+// that whoever ran them reads it. error_log() would put it wherever php.ini
+// says, which for a cron job is usually nowhere anyone looks.
+$diagnostics = new Diagnostics(static function (string $message): void {
+    fwrite(STDERR, $message . "\n");
+});
 
 $command = isset($argv[1]) ? $argv[1] : 'help';
 $options = getopt('', ['dsn::', 'environment::', 'release::', 'spool-dir::', 'timeout-ms::']);
@@ -39,11 +47,33 @@ if ($command === 'test') {
         'release' => $release !== '' ? $release : null,
         'auto_capture' => false,
         'request_timeout_ms' => $timeout,
+        'on_diagnostic' => static function (string $message): void {
+            fwrite(STDERR, $message . "\n");
+        },
     ]);
     $client->captureMessage('MONICA PHP SDK connectivity test', 'info', [
         'tags' => ['source' => 'monica-cli'],
     ]);
     if (!$client->flush($timeout)) {
+        $response = $client->lastResponse();
+        // A 422 and a 401 have already printed themselves through the handler
+        // above. Every other failure only has a status, and saying which one it
+        // was is the difference between a wrong key and MONICA being down.
+        if (
+            $response !== null
+            && $response->status() !== null
+            && !Diagnostics::reports($response->status())
+        ) {
+            fwrite(
+                STDERR,
+                'MONICA answered HTTP ' . $response->status()
+                . ($response->errorCode() !== null ? ' (' . $response->errorCode() . ')' : '')
+                . ".\n"
+            );
+            foreach ($response->issues() as $issue) {
+                fwrite(STDERR, ' - ' . $issue['path'] . ': ' . $issue['message'] . "\n");
+            }
+        }
         fwrite(STDERR, "MONICA connectivity test failed.\n");
         exit(1);
     }
@@ -56,7 +86,7 @@ if ($command === 'spool:flush') {
         fwrite(STDERR, "MONICA_DSN or --dsn is required.\n");
         exit(2);
     }
-    $flusher = new SpoolFlusher($spoolDirectory, new CurlTransport($dsn));
+    $flusher = new SpoolFlusher($spoolDirectory, new CurlTransport($dsn, $diagnostics));
     $result = $flusher->flush($timeout);
     fwrite(
         STDOUT,

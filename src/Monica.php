@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Monica;
 
 use LogicException;
+use Monica\Transport\Response;
 use Throwable;
 
 final class Monica
@@ -43,6 +44,15 @@ final class Monica
     public static function flush(int $timeoutMilliseconds = 2000): bool
     {
         return self::client()->flush($timeoutMilliseconds);
+    }
+
+    /**
+     * Why the last `flush()` answered the way it did: status, `error.code` and
+     * a 422's `issues[].path`. Null before the first attempt.
+     */
+    public static function lastResponse(): ?Response
+    {
+        return self::client()->lastResponse();
     }
 
     public static function client(): Client
