@@ -27,8 +27,9 @@ composer require ah-monica/monica
 ]);
 ```
 
-DSN は `https://msk_xxxxx@<host>/` の形式で、送信先は `<host>/v1/envelope` になります。
-`https` が必須です（`localhost` / `127.0.0.1` に限り `http` も使えます）。
+DSN は `https://msk_xxxxx@<host>/` の形式で、送信先は DSN の host（port を書いた場合は
+port も）に `/v1/envelope` を付けた URL です。DSN の path は使いません。`https` が必須
+です（`localhost` / `127.0.0.1` に限り `http` も使えます）。
 
 `init()` は例外 handler・error handler・shutdown function を登録します。既存の
 handler がある場合は、SDK の処理後にその handler へ chain します。登録したくない
@@ -52,7 +53,8 @@ handler がある場合は、SDK の処理後にその handler へ chain しま�
 で、送らなかった場合（sampling で外れた、`before_send` が `null` を返した）は `null`
 です。
 
-queue に溜まった event は shutdown 時に自動で送られます。その前に送りたい場合は
+queue に溜まった event は shutdown 時に自動で送られます（`auto_capture` を `false` に
+した場合は送られないので、自分で `flush()` を呼びます）。その前に送りたい場合も
 `flush()` を呼びます。
 
 ```php
@@ -74,6 +76,7 @@ envelope が送られません。間隔は 1 分程度が扱いやすく、同�
 ません。
 
 ```cron
+MONICA_DSN=https://msk_xxxxx@<host>/
 * * * * * /usr/bin/php /srv/app/vendor/bin/monica spool:flush >> /var/log/monica-spool.log 2>&1
 ```
 
@@ -118,9 +121,11 @@ vendor/bin/monica test
 vendor/bin/monica spool:flush --spool-dir=/var/spool/monica
 ```
 
-`test` は疎通確認の event を 1 件送ります。共通の option は `--dsn`、`--environment`、
-`--release`、`--spool-dir`、`--timeout-ms`（既定 2000）で、`MONICA_DSN`、
-`MONICA_ENVIRONMENT`、`MONICA_RELEASE`、`MONICA_SPOOL_DIR` からも読みます。
+`test` は疎通確認の event を 1 件送ります。option は `test` が `--dsn`、
+`--environment`、`--release`、`--timeout-ms`（既定 2000）、`spool:flush` が `--dsn`、
+`--spool-dir`、`--timeout-ms` で、それぞれ `MONICA_DSN`、`MONICA_ENVIRONMENT`、
+`MONICA_RELEASE`、`MONICA_SPOOL_DIR` からも読みます。どちらも DSN が必要で、無い場合は
+exit code 2 です。
 
 ### PSR-18 client を使う
 
@@ -151,7 +156,7 @@ client 側で 2 秒程度に設定してください。
 | `auto_capture` | bool | `true` | `false` で handler を登録しません |
 | `error_types` | int | `E_WARNING｜E_USER_WARNING｜E_NOTICE｜E_USER_NOTICE` | 収集する PHP error の bitmask。fatal error は別途 shutdown で拾います |
 | `sample_rate` | float | `1.0` | 0〜1。範囲外は例外 |
-| `before_send` | callable\|null | `null` | 送信直前の event 配列を受け取り、加工した配列か `null`（破棄）を返す |
+| `before_send` | callable\|null | `null` | queue に入れる前の event 配列を受け取り、加工した配列か `null`（破棄）を返す |
 | `on_diagnostic` | callable\|false\|null | `error_log()` へ 1 行 | 警告の出力先。`false` / `null` で無効 |
 | `max_queue_size` | int | `100` | 超えた分は古い event から捨て、`discarded` として MONICA に伝えます |
 | `batch_size` | int | `100` | envelope 1 通あたりの item 数。実効値は `min(指定値, 100, max_queue_size)` |
@@ -162,7 +167,7 @@ client 側で 2 秒程度に設定してください。
 | `project_root` | string\|null | `null` | stack frame の `in_app` 判定の基準 |
 | `server_name` | string\|null | `gethostname()` の値 | event の `server_name` |
 | `http_client` / `request_factory` / `stream_factory` | PSR-18 / PSR-17 | `null` | 3 つまとめて渡します。1 つでも欠けると例外 |
-| `transport_instance` | `Monica\Transport\TransportInterface` | `null` | transport を差し替えます |
+| `transport_instance` | `Monica\Transport\TransportInterface` | `null` | transport を差し替えます（`transport` が `spool` のときは使いません） |
 
 正の整数を取る option（`max_queue_size`、`batch_size`、`request_timeout_ms`、
 `spool_max_files`、`memory_reserve_bytes`）に 1 未満を渡すと例外になります。
@@ -176,7 +181,8 @@ client 側で 2 秒程度に設定してください。
 - shutdown 時の fatal error・OOM・実行時間超過
 
 event に自動で入るのは、`event_id`、`timestamp`、`level`、`platform`（`php`）、
-`environment`、`release`、`server_name`（`gethostname()`）、例外の class 名・
+`environment`、`release`（設定したときだけ）、`server_name`（`server_name` option が
+無ければ `gethostname()`。取れなければ key 自体が入りません）、例外の class 名・
 message・stack frame（ファイル名・関数名・行番号・`in_app`）です。連鎖した例外は
 10 段、stack frame は 200 段までです。
 
@@ -186,9 +192,9 @@ request body、Cookie、Authorization ヘッダ、SQL 引数、`$_SERVER` は読
 
 ### Privacy
 
-`before_send` は送信直前の event 配列を受け取り、加工後の配列か、破棄する場合は
-`null` を返します。個人情報を扱うサービスでは、blacklist ではなく MONICA へ送って
-よいキーだけで event を組み直す allowlist 方式を推奨します。
+`before_send` は queue に入れる前の event 配列を受け取り、加工後の配列か、破棄する
+場合は `null` を返します。個人情報を扱うサービスでは、blacklist ではなく MONICA へ
+送ってよいキーだけで event を組み直す allowlist 方式を推奨します。
 
 ```php
 'before_send' => static function (array $event): array {

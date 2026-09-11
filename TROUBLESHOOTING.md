@@ -33,10 +33,12 @@
   `measured by the SDK`、MONICA が `413` を返した場合が `ingest answered 413` です
 - 諦めた警告の `M` は envelope の item 数で、読めなかった場合は
   `an unknown number of` です
+- item を捨てた警告と諦めた警告は SDK 自身が出すものなので、`$response` は MONICA の
+  応答ではなく、status を持たない合成値です
 
-警告が出るのは `422` と `401` だけです。`400` などその他の 4xx、`429`、`5xx`、
-ネットワーク障害では出ません。`401` で送信が止まったあとに捨てられた envelope に
-ついても出しません（同じ 1 行が埋まるため）。
+MONICA の応答について警告が出るのは `422` と `401` だけです。`400` などその他の 4xx、
+`429`、`5xx`、ネットワーク障害では出ません。`401` で送信が止まったあとに捨てられた
+envelope についても出しません（同じ 1 行が埋まるため）。
 
 ## ingest が envelope を拒否したとき
 
@@ -143,7 +145,7 @@ flush 中に process が停止して残った claim（`.sending-<pid>-…`）は
 | 初期化で `dsn carries a public key (mpk_)…` の例外 | DSN に public key を書いています。PHP SDK は secret key（`msk_`）を使います |
 | 初期化で `dsn must use https except for localhost` の例外 | `localhost` / `127.0.0.1` 以外では `https` が必要です |
 | 初期化で `http_client, request_factory and stream_factory must be supplied together` の例外 | PSR-18 経路はこの 3 つをまとめて渡します |
-| `The cURL extension is required when no PSR-18 client is supplied` | `ext-curl` が無い環境です。拡張を入れるか PSR-18 client を渡してください |
+| `ext-curl` が無い環境で event が届かず、`monica test` も失敗する | 既定の transport は `ext-curl` を使います。拡張を入れるか PSR-18 client を渡してください。送信中の例外はアプリケーションへ投げ返さないので、警告は出ません |
 | event がまったく届かず、警告も出ない | `vendor/bin/monica test` で疎通を確認してください。`sample_rate` と `before_send` が event を落としていないかも確認します |
 | mod_php でレスポンスが `request_timeout_ms` 分遅くなる | `shutdown` は mod_php ではレスポンスをブロックします。`spool` に切り替えてください |
 | `spool:flush` の `deferred` だけが増える | 再送の待ち時間です。`spool:flush` を定期実行していれば時刻が来たら送られます |
