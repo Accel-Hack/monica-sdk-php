@@ -7,6 +7,7 @@ require __DIR__ . '/bootstrap.php';
 use Monica\Client;
 use Monica\Transport\CurlTransport;
 use Monica\Transport\Diagnostics;
+use Monica\Transport\EnvelopeSplitter;
 use Monica\Transport\Outcome;
 use Monica\Transport\OutcomeAwareInterface;
 use Monica\Transport\Psr18Transport;
@@ -876,6 +877,319 @@ if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class
     $discardSpool($spoolRejectDirectory);
 }
 
+// --- 413: splitting an envelope on the byte limits -------------------------
+//
+// ingest.md caps an envelope at 1 MiB gzipped, and says the SDK splits what
+// does not fit on item boundaries. Batching by item count cannot see that: a
+// hundred small items fit easily, a hundred large ones do not.
+
+if (interface_exists(ClientInterface::class) && class_exists(Psr17Factory::class)) {
+    $factory = new Psr17Factory();
+
+    /**
+     * A client that records the envelope of every request, and can answer 413
+     * for anything above a given item count. Bodies arrive gzipped, so the
+     * recorded envelopes are what the transport really sent.
+     */
+    $splitClient = new class($factory) implements ClientInterface {
+        /** @var Psr17Factory */
+        private $factory;
+        /** @var list<array<string, mixed>> */
+        public array $envelopes = [];
+        /** @var list<int> */
+        public array $gzipBytes = [];
+        public int $status = 202;
+        public ?int $maxItems = null;
+
+        public function __construct(Psr17Factory $factory)
+        {
+            $this->factory = $factory;
+        }
+
+        public function sendRequest(RequestInterface $request): ResponseInterface
+        {
+            $raw = (string) $request->getBody();
+            $json = gzdecode($raw);
+            expect($json !== false, 'the request body should always be gzipped');
+            $envelope = json_decode((string) $json, true);
+            expect(is_array($envelope), 'the request body should decode to an envelope');
+            $this->envelopes[] = $envelope;
+            $this->gzipBytes[] = strlen($raw);
+            if ($this->maxItems !== null && count($envelope['items']) > $this->maxItems) {
+                return $this->factory->createResponse(413);
+            }
+
+            return $this->factory->createResponse($this->status);
+        }
+    };
+
+    $itemsOf = static function (array $envelopes): array {
+        $messages = [];
+        foreach ($envelopes as $envelope) {
+            foreach ($envelope['items'] as $item) {
+                $messages[] = $item['message'];
+            }
+        }
+
+        return $messages;
+    };
+
+    $bigEnvelope = static function (int $itemCount, int $itemBytes) use ($rejectionEnvelope): array {
+        $envelope = $rejectionEnvelope;
+        $envelope['discarded'] = 7;
+        $envelope['items'] = [];
+        for ($index = 0; $index < $itemCount; $index++) {
+            $envelope['items'][] = [
+                'type' => 'message',
+                'message' => 'item ' . $index,
+                // Base64 of random bytes does not compress, so the envelope is
+                // as large after gzip as it looks. Lorem ipsum would not be.
+                'padding' => base64_encode(random_bytes($itemBytes)),
+            ];
+        }
+
+        return $envelope;
+    };
+
+    // Measured by the SDK: four items of ~400 KB are over the 1 MiB cap
+    // together and under it in halves.
+    $splitTransport = new Psr18Transport(
+        'https://secret@ingest.example.test/1',
+        $splitClient,
+        $factory,
+        $factory
+    );
+    $oversized = $bigEnvelope(4, 400 * 1024);
+    $splitResponse = $splitTransport->sendEnvelopeResponse($oversized, 2000);
+    expect($splitResponse->outcome() === Outcome::ACCEPTED, 'a split envelope should be accepted');
+    expect($splitResponse->droppedItems() === 0, 'nothing should be dropped when halving works');
+    expect(
+        count($splitClient->envelopes) > 1,
+        'an envelope over the gzip limit should be split across requests, got '
+        . count($splitClient->envelopes)
+    );
+    foreach ($splitClient->gzipBytes as $position => $bytes) {
+        expect(
+            $bytes <= EnvelopeSplitter::MAX_GZIP_BYTES,
+            'request ' . $position . ' carries ' . $bytes . ' gzip bytes, over the published limit'
+        );
+    }
+    expect(
+        $itemsOf($splitClient->envelopes) === ['item 0', 'item 1', 'item 2', 'item 3'],
+        'splitting should keep every item, in order: '
+        . json_encode($itemsOf($splitClient->envelopes))
+    );
+    $reportedDiscarded = array_sum(array_map(
+        static function (array $envelope): int {
+            return (int) $envelope['discarded'];
+        },
+        $splitClient->envelopes
+    ));
+    expect(
+        $reportedDiscarded === 7,
+        'discarded belongs to the envelope, not to each half: reported ' . $reportedDiscarded
+    );
+
+    // MONICA's cap is its own: limits.json is a copy, so a 413 on something the
+    // SDK measured as fitting still has to be split and posted again.
+    $splitClient->envelopes = [];
+    $splitClient->gzipBytes = [];
+    $splitClient->maxItems = 1;
+    $small = $rejectionEnvelope;
+    $small['items'] = [
+        ['type' => 'message', 'message' => 'a'],
+        ['type' => 'message', 'message' => 'b'],
+        ['type' => 'message', 'message' => 'c'],
+        ['type' => 'message', 'message' => 'd'],
+    ];
+    $retriedResponse = $splitTransport->sendEnvelopeResponse($small, 2000);
+    expect(
+        $retriedResponse->outcome() === Outcome::ACCEPTED,
+        'a 413 should be answered by splitting, not by dropping the envelope'
+    );
+    expect($retriedResponse->droppedItems() === 0, 'four items that fit one by one should all be sent');
+    $accepted = array_values(array_filter(
+        $splitClient->envelopes,
+        static function (array $envelope): bool {
+            return count($envelope['items']) === 1;
+        }
+    ));
+    expect(count($accepted) === 4, 'each item should end up in its own envelope, got ' . count($accepted));
+    expect(
+        $itemsOf($accepted) === ['a', 'b', 'c', 'd'],
+        'a 413-driven split should keep every item, in order: ' . json_encode($itemsOf($accepted))
+    );
+
+    // A single item that ingest still refuses cannot be split any further.
+    // Posting it forever would stall everything behind it, so it is dropped --
+    // loudly, and counted in the next envelope's discarded.
+    $splitClient->envelopes = [];
+    $splitClient->maxItems = 0;
+    $dropWarnings = [];
+    $droppingTransport = new Psr18Transport(
+        'https://secret@ingest.example.test/1',
+        $splitClient,
+        $factory,
+        $factory,
+        new Diagnostics(static function (string $message) use (&$dropWarnings): void {
+            $dropWarnings[] = $message;
+        })
+    );
+    $singleItem = $rejectionEnvelope;
+    $singleItem['items'] = [['type' => 'message', 'message' => 'too big to send']];
+    $droppedResponse = $droppingTransport->sendEnvelopeResponse($singleItem, 2000);
+    expect(
+        $droppedResponse->outcome() === Outcome::ACCEPTED,
+        'an unsplittable item counts as handled: retrying it can never work'
+    );
+    expect(
+        $droppedResponse->droppedItems() === 1,
+        'the dropped item should be counted: ' . $droppedResponse->droppedItems()
+    );
+    expect(
+        count($dropWarnings) === 1 && strpos($dropWarnings[0], 'monica: dropped 1 item(s)') === 0,
+        'dropping an item should be reported: ' . json_encode($dropWarnings)
+    );
+    expect(
+        strpos($dropWarnings[0], 'ingest answered 413') !== false,
+        'the warning should say who refused it: ' . $dropWarnings[0]
+    );
+
+    // ... and the client tells MONICA about it in the next envelope.
+    $splitClient->envelopes = [];
+    $splitClient->maxItems = 0;
+    $droppingClient = new Client([
+        'dsn' => 'https://secret@ingest.example.test/1',
+        'environment' => 'test',
+        'http_client' => $splitClient,
+        'request_factory' => $factory,
+        'stream_factory' => $factory,
+        'auto_capture' => false,
+        'on_diagnostic' => false,
+    ]);
+    $droppingClient->captureMessage('too big to send');
+    expect($droppingClient->flush(), 'an envelope whose only item was dropped should not stay queued');
+    expect($droppingClient->queuedEvents() === [], 'the dropped event should leave the queue');
+    $splitClient->maxItems = null;
+    $droppingClient->captureMessage('the next one');
+    expect($droppingClient->flush(), 'the next envelope should be accepted');
+    $lastEnvelope = $splitClient->envelopes[count($splitClient->envelopes) - 1];
+    expect(
+        $lastEnvelope['discarded'] === 1,
+        'a dropped item should be reported as discarded in the next envelope: '
+        . json_encode($lastEnvelope['discarded'])
+    );
+
+    // A single item measured as too big by the SDK never leaves at all: there
+    // is no point asking MONICA about 8 MiB of JSON.
+    $splitClient->envelopes = [];
+    $splitClient->maxItems = null;
+    $selfDropWarnings = [];
+    $selfDroppingTransport = new Psr18Transport(
+        'https://secret@ingest.example.test/1',
+        $splitClient,
+        $factory,
+        $factory,
+        new Diagnostics(static function (string $message) use (&$selfDropWarnings): void {
+            $selfDropWarnings[] = $message;
+        })
+    );
+    $hugeItem = $bigEnvelope(1, 2 * 1024 * 1024);
+    $selfDropped = $selfDroppingTransport->sendEnvelopeResponse($hugeItem, 2000);
+    expect($splitClient->envelopes === [], 'an item over the cap should not be posted at all');
+    expect($selfDropped->droppedItems() === 1, 'the oversized item should be counted as dropped');
+    expect(
+        count($selfDropWarnings) === 1
+        && strpos($selfDropWarnings[0], 'measured by the SDK') !== false,
+        'the SDK should say it refused the item itself: ' . json_encode($selfDropWarnings)
+    );
+
+    // A drop and a failure in the same flush. The oversized item is gone
+    // whatever happens to the rest, so it must not stay in the queue: retrying
+    // it would drop it again, and warn again, on every flush.
+    $splitClient->envelopes = [];
+    $splitClient->maxItems = null;
+    $splitClient->status = 500;
+    $mixedWarnings = [];
+    $mixedClient = new Client([
+        'dsn' => 'https://secret@ingest.example.test/1',
+        'environment' => 'test',
+        'http_client' => $splitClient,
+        'request_factory' => $factory,
+        'stream_factory' => $factory,
+        'auto_capture' => false,
+        'on_diagnostic' => static function (string $message) use (&$mixedWarnings): void {
+            $mixedWarnings[] = $message;
+        },
+        'before_send' => static function (array $event): array {
+            if ($event['message'] === 'too big to send') {
+                // Base64 of random bytes does not compress, so this really is
+                // over the cap once gzipped.
+                $event['padding'] = base64_encode(random_bytes(2 * 1024 * 1024));
+            }
+
+            return $event;
+        },
+    ]);
+    // The oversized event is queued first, so halving separates it from the two
+    // that could be sent if MONICA were up.
+    $mixedClient->captureMessage('too big to send');
+    $mixedClient->captureMessage('b');
+    $mixedClient->captureMessage('c');
+    expect(count($mixedClient->queuedEvents()) === 3, 'the test should have queued three events');
+    expect(!$mixedClient->flush(), 'a 5xx should make flush() answer no');
+    $remaining = array_map(
+        static function (array $event) {
+            return $event['message'];
+        },
+        $mixedClient->queuedEvents()
+    );
+    expect(
+        $remaining === ['b', 'c'],
+        'the dropped item should leave the queue while the rest stays: ' . json_encode($remaining)
+    );
+    expect(
+        count($mixedWarnings) === 1,
+        'the drop should be reported once, not once per flush: ' . json_encode($mixedWarnings)
+    );
+    // MONICA comes back: the loss is reported in the envelope that finally
+    // leaves, and the oversized item is not tried again.
+    $splitClient->status = 202;
+    $splitClient->envelopes = [];
+    expect($mixedClient->flush(), 'the rest of the queue should be accepted once MONICA is up');
+    expect(
+        count($mixedWarnings) === 1,
+        'the dropped item should not be dropped a second time: ' . json_encode($mixedWarnings)
+    );
+    expect(count($splitClient->envelopes) === 1, 'the remaining events should fit one envelope');
+    expect(
+        $splitClient->envelopes[0]['discarded'] === 1,
+        'the drop should be reported as discarded even though the flush that dropped it failed: '
+        . json_encode($splitClient->envelopes[0]['discarded'])
+    );
+    expect(
+        $itemsOf($splitClient->envelopes) === ['b', 'c'],
+        'only the sendable events should be sent: ' . json_encode($itemsOf($splitClient->envelopes))
+    );
+
+    // A failure part-way through stops the run: whatever refused one piece
+    // refuses the rest.
+    $splitClient->envelopes = [];
+    $splitClient->maxItems = 1;
+    $splitClient->status = 500;
+    $failingSplit = $splitTransport->sendEnvelopeResponse($small, 2000);
+    expect(
+        $failingSplit->outcome() === Outcome::RETRYABLE,
+        'a 5xx on the first piece should be reported as retryable'
+    );
+    expect(
+        count($splitClient->envelopes) === 3,
+        'the run should stop at the failing piece: ' . count($splitClient->envelopes)
+    );
+    $splitClient->status = 202;
+    $splitClient->maxItems = null;
+}
+
 // The cURL transport cannot be handed a stubbed client: it talks to a socket,
 // so the same matrix runs against PHP's built-in server. Nothing else in this
 // file exercises the default transport's response handling at all.
@@ -964,6 +1278,86 @@ if (function_exists('curl_init') && function_exists('proc_open')) {
         expect(
             is_array($arrived) && $arrived['messages'] === ['posted by cURL'],
             'cURL: the envelope items should arrive intact: ' . $delivered[0]
+        );
+
+        // A 413 over a real socket: the stub refuses anything with more than
+        // one item, so the transport has to halve its way down to singles.
+        expect(
+            file_put_contents($controlFile, (string) json_encode([
+                'status' => 202,
+                'body' => '',
+                'max_items' => 1,
+            ])) !== false,
+            'the test should be able to direct the stub server'
+        );
+        expect(file_put_contents($logFilePath, '') !== false, 'the test should be able to clear the log');
+        $curlSplit = new CurlTransport('http://secret@127.0.0.1:' . $port . '/1');
+        $curlSplitEnvelope = $rejectionEnvelope;
+        $curlSplitEnvelope['items'] = [
+            ['type' => 'message', 'message' => 'a'],
+            ['type' => 'message', 'message' => 'b'],
+            ['type' => 'message', 'message' => 'c'],
+            ['type' => 'message', 'message' => 'd'],
+        ];
+        $curlSplitResponse = $curlSplit->sendEnvelopeResponse($curlSplitEnvelope, 5000);
+        expect(
+            $curlSplitResponse->outcome() === Outcome::ACCEPTED,
+            'cURL: a 413 should be answered by splitting'
+        );
+        expect($curlSplitResponse->droppedItems() === 0, 'cURL: nothing should be dropped');
+        $curlRequests = array_map(
+            static function (string $line) {
+                return json_decode($line, true);
+            },
+            array_values(array_filter(explode("\n", (string) file_get_contents($logFilePath))))
+        );
+        $curlSingles = array_values(array_filter(
+            $curlRequests,
+            static function ($request): bool {
+                return is_array($request) && $request['items'] === 1;
+            }
+        ));
+        expect(
+            count($curlSingles) === 4,
+            'cURL: every item should end up in its own envelope, got ' . count($curlSingles)
+        );
+        $curlDelivered = [];
+        foreach ($curlSingles as $request) {
+            $curlDelivered[] = $request['messages'][0];
+        }
+        expect(
+            $curlDelivered === ['a', 'b', 'c', 'd'],
+            'cURL: a split should keep every item, in order: ' . json_encode($curlDelivered)
+        );
+
+        // ... and an item ingest refuses on its own is dropped, not posted for
+        // ever.
+        expect(
+            file_put_contents($controlFile, (string) json_encode([
+                'status' => 202,
+                'body' => '',
+                'max_items' => 0,
+            ])) !== false,
+            'the test should be able to direct the stub server'
+        );
+        $curlDropWarnings = [];
+        $curlDropping = new CurlTransport(
+            'http://secret@127.0.0.1:' . $port . '/1',
+            new Diagnostics(static function (string $message) use (&$curlDropWarnings): void {
+                $curlDropWarnings[] = $message;
+            })
+        );
+        $curlSingleItem = $rejectionEnvelope;
+        $curlSingleItem['items'] = [['type' => 'message', 'message' => 'too big']];
+        $curlDropped = $curlDropping->sendEnvelopeResponse($curlSingleItem, 5000);
+        expect(
+            $curlDropped->droppedItems() === 1 && $curlDropped->outcome() === Outcome::ACCEPTED,
+            'cURL: an unsplittable item should be dropped and counted'
+        );
+        expect(
+            count($curlDropWarnings) === 1
+            && strpos($curlDropWarnings[0], 'ingest answered 413') !== false,
+            'cURL: dropping an item should be reported: ' . json_encode($curlDropWarnings)
         );
 
         // The same stop, on the transport that actually opens a socket.

@@ -37,6 +37,7 @@ use Monica\Client;
 use Monica\EventFactory;
 use Monica\Tests\Spec\JsonSchema;
 use Monica\Transport\Dsn;
+use Monica\Transport\EnvelopeSplitter;
 use Monica\Transport\Outcome;
 use Monica\Transport\Response;
 use Monica\Transport\TransportInterface;
@@ -249,6 +250,21 @@ expect(
 );
 expect($limits['items_per_envelope'] === 100, 'this SDK batches to 100 items per envelope');
 expect($limits['frames_per_stacktrace'] === 200, 'this SDK truncates stack traces to 200 frames');
+
+// The byte caps are constants in the SDK because `spec/` is a development-time
+// copy and is not shipped in the package, so there is nothing to read at
+// runtime. This is the comparison that keeps the copy honest: MONICA changing
+// a cap fails here instead of turning into 413s in production.
+expect(
+    EnvelopeSplitter::MAX_GZIP_BYTES === $limits['envelope_gzip_bytes'],
+    'EnvelopeSplitter::MAX_GZIP_BYTES (' . EnvelopeSplitter::MAX_GZIP_BYTES
+    . ') must match limits.json (' . $limits['envelope_gzip_bytes'] . ')'
+);
+expect(
+    EnvelopeSplitter::MAX_DECOMPRESSED_BYTES === $limits['envelope_decompressed_bytes'],
+    'EnvelopeSplitter::MAX_DECOMPRESSED_BYTES (' . EnvelopeSplitter::MAX_DECOMPRESSED_BYTES
+    . ') must match limits.json (' . $limits['envelope_decompressed_bytes'] . ')'
+);
 
 $platforms = $schema->pointer('/$defs/errorItem/properties/platform/enum');
 expect(
@@ -651,10 +667,12 @@ expect(
     'transport.json should describe both a secret and a public key scheme'
 );
 
-// This SDK implements part of transport.json. `status` has a consumer now --
-// Outcome classifies a response, the spool flusher acts on it, and a 422's
-// error.json body is read so its issues reach the caller -- but not every cell
-// of the table (see the mapping below), and `retry` still has no consumer:
+// This SDK implements part of transport.json. `status` has a consumer for every
+// cell of the table now -- Outcome classifies a response, the spool flusher
+// acts on it, a 422's error.json body is read so its issues reach the caller,
+// and a 413 makes the transport split the envelope and post again. It stays
+// "partial" because 429's cell is `wait_retry_after` and nothing waits: that
+// belongs to `retry`, which still has no consumer at all:
 // nothing reads `Retry-After` or backs off. Pinning the vocabulary here turns
 // "MONICA grew an obligation the PHP SDK ignores" into a failing test instead of
 // a silent gap.
@@ -698,10 +716,11 @@ $sdkHandling = [
     // Retry-After or backing off.
     'wait_retry_after' => Outcome::RETRYABLE,
     'backoff' => Outcome::RETRYABLE,
-    // A deliberate divergence: splitting on the byte limits is unimplemented,
-    // so a 413 cannot be retried into anything but another 413. It is dropped
-    // rather than kept forever. When the split lands, this line changes with it.
-    'split_and_retry' => Outcome::REJECTED,
+    // A 413 refuses the bytes, not the content, so the same items can be
+    // accepted spread over more envelopes. EnvelopeSplitter halves the piece
+    // inside the transport and posts again, which is why a 413 seldom reaches
+    // a caller -- but the classification has to say "not permanent".
+    'split_and_retry' => Outcome::RETRYABLE,
 ];
 foreach ($transportSpec['status'] as $status => $behaviour) {
     expect(

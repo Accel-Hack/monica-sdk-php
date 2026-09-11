@@ -8,7 +8,6 @@ use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestFactoryInterface;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\StreamFactoryInterface;
-use RuntimeException;
 use Throwable;
 
 final class Psr18Transport implements
@@ -23,6 +22,7 @@ final class Psr18Transport implements
     /** @var array{endpoint: string, key: string} */
     private array $dsn;
     private Diagnostics $diagnostics;
+    private EnvelopeSplitter $splitter;
     private bool $stopped = false;
 
     public function __construct(
@@ -37,6 +37,7 @@ final class Psr18Transport implements
         $this->requestFactory = $requestFactory;
         $this->streamFactory = $streamFactory;
         $this->diagnostics = $diagnostics ?? new Diagnostics();
+        $this->splitter = new EnvelopeSplitter($this->diagnostics);
     }
 
     public function send(array $envelope, int $timeoutMilliseconds): bool
@@ -71,40 +72,45 @@ final class Psr18Transport implements
         }
 
         try {
-            $json = json_encode(
-                $envelope,
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-            );
-            $body = gzencode($json, 6);
-            if ($body === false) {
-                throw new RuntimeException('Unable to gzip the MONICA envelope');
-            }
-            $request = $this->requestFactory
-                ->createRequest('POST', $this->dsn['endpoint'])
-                ->withHeader('Authorization', 'Bearer ' . $this->dsn['key'])
-                ->withHeader('Content-Type', 'application/json')
-                ->withHeader('Content-Encoding', 'gzip')
-                ->withBody($this->streamFactory->createStream($body));
-            $response = $this->client->sendRequest($request);
-            $status = $response->getStatusCode();
-            $result = Response::forStatus(
-                $status,
-                Response::carriesDiagnostics($status) ? self::readBody($response) : null
-            );
-            if ($result->outcome() === Outcome::REJECTED_STOP) {
-                $this->stopped = true;
-            }
-            // Reporting cannot throw, so this does not turn a rejection into
-            // the network failure below.
-            $this->diagnostics->report($result);
-
-            return $result;
+            // The envelope may go out as more than one request: ingest caps an
+            // envelope in bytes, and the splitter is what keeps one oversized
+            // batch from being lost whole.
+            return $this->splitter->send($envelope, function (string $body): Response {
+                return $this->post($body);
+            });
         } catch (Throwable $ignored) {
             // Transport failures never escape into application handlers. Apart
             // from protecting the host, this prevents recursive MONICA events.
             // A PSR-18 client throws on a network failure, which is retryable.
             return Response::forNetworkFailure();
         }
+    }
+
+    /**
+     * One request: one gzipped envelope, already known to fit.
+     */
+    private function post(string $body): Response
+    {
+        $request = $this->requestFactory
+            ->createRequest('POST', $this->dsn['endpoint'])
+            ->withHeader('Authorization', 'Bearer ' . $this->dsn['key'])
+            ->withHeader('Content-Type', 'application/json')
+            ->withHeader('Content-Encoding', 'gzip')
+            ->withBody($this->streamFactory->createStream($body));
+        $response = $this->client->sendRequest($request);
+        $status = $response->getStatusCode();
+        $result = Response::forStatus(
+            $status,
+            Response::carriesDiagnostics($status) ? self::readBody($response) : null
+        );
+        if ($result->outcome() === Outcome::REJECTED_STOP) {
+            $this->stopped = true;
+        }
+        // Reporting cannot throw, so this does not turn a rejection into the
+        // network failure the caller catches.
+        $this->diagnostics->report($result);
+
+        return $result;
     }
 
     /**

@@ -99,6 +99,23 @@ body が空・非JSON・`error.json` に適合しない・64 KiBを超える場�
 issues無しの拒否として扱います。`400` などの他の4xxは警告を出しません（`429` は
 body を読みません）。
 
+## envelopeの分割
+
+envelope 1 通の上限は gzip 後 1 MiB・展開後 8 MiB です（`ingest.md`）。item 数 100 で
+の分割（`batch_size`）とは別に、transport が送信前に gzip 後の byte 数を測り、
+**上限を超える envelope を item 境界で半分に割って**、収まるまで繰り返します。
+1 通が複数 requestになります。MONICA が `413` を返した場合も割って送り直します。
+
+**item 1 件だけで上限を超える場合はその item を捨てます。** 捨てたことは警告に出し、
+次の envelope の `discarded` で MONICA にも伝えます。
+
+```text
+monica: dropped 1 item(s) that cannot fit one envelope (1234567 gzip bytes, limit 1048576, measured by the SDK); the event(s) are lost
+```
+
+byte 上限は `Monica\Transport\EnvelopeSplitter::MAX_GZIP_BYTES` /
+`MAX_DECOMPRESSED_BYTES` の定数です。
+
 DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
 送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
 `401`になり、eventが黙って消えるだけだからです。
@@ -183,13 +200,12 @@ PHP だけ気付けない状態を作らないためです。schema を通るこ
 
 ### まだ実装していない契約
 
-`transport.json` のうち実装しているのは `endpoint` / `dsn` / `auth` と `status` の
-一部です。残っているのは次の2つです。
+`transport.json` のうち実装しているのは `endpoint` / `dsn` / `auth` と `status` です。
+`413` は transport が envelope を分割して送り直します（[envelopeの分割](#envelopeの分割)）。
+残っているのは次の1つです。
 
 - `retry`（`Retry-After`、backoff、回数上限）。再送は次の flush で送り直すだけで、
   待ち時間も回数上限もありません。`shutdown` は再送しません
-- `413` の `split_and_retry`。envelope の byte 上限（gzip 1 MiB / 展開後 8 MiB）での
-  分割が未実装で、恒久失敗として扱います。item 数 100 での分割はあります
 
 契約テストは `transport.json` の section 名、status の語彙、status ごとの分類を
 固定しています。

@@ -16,12 +16,14 @@ final class CurlTransport implements
     /** @var array{endpoint: string, key: string} */
     private array $dsn;
     private Diagnostics $diagnostics;
+    private EnvelopeSplitter $splitter;
     private bool $stopped = false;
 
     public function __construct(string $dsn, ?Diagnostics $diagnostics = null)
     {
         $this->dsn = Dsn::parse($dsn);
         $this->diagnostics = $diagnostics ?? new Diagnostics();
+        $this->splitter = new EnvelopeSplitter($this->diagnostics);
     }
 
     public function send(array $envelope, int $timeoutMilliseconds): bool
@@ -56,12 +58,22 @@ final class CurlTransport implements
             throw new RuntimeException('The cURL extension is required when no PSR-18 client is supplied');
         }
 
-        $json = json_encode($envelope, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
-        $requestBody = gzencode($json, 6);
-        if ($requestBody === false) {
-            throw new RuntimeException('Unable to gzip the MONICA envelope');
-        }
+        // The envelope may go out as more than one request: ingest caps an
+        // envelope in bytes, and the splitter is what keeps one oversized batch
+        // from being lost whole.
+        return $this->splitter->send(
+            $envelope,
+            function (string $body) use ($timeoutMilliseconds): Response {
+                return $this->post($body, $timeoutMilliseconds);
+            }
+        );
+    }
 
+    /**
+     * One request: one gzipped envelope, already known to fit.
+     */
+    private function post(string $requestBody, int $timeoutMilliseconds): Response
+    {
         $handle = curl_init($this->dsn['endpoint']);
         if ($handle === false) {
             throw new RuntimeException('Unable to initialize cURL');
