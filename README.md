@@ -1,6 +1,16 @@
 # ah-monica/monica
 
-Frameworkに依存せず、PHP 7.4以上からMONICAへ例外を送るcore SDKです。
+Framework に依存しない PHP 用の core SDK です。未捕捉例外・PHP error・fatal error を
+MONICA の ingest へ送ります。
+
+## 対応環境
+
+- PHP 7.4 以上（7.4 / 8.0 / 8.3 / 8.5 で検証しています）
+- 必須拡張: `ext-json`、`ext-zlib`
+- 既定の HTTP transport は `ext-curl` を使います。PSR-18 client を渡す場合は不要です
+- SAPI: FPM / FastCGI、CLI、mod_php（mod_php は「制約」を参照）
+
+## インストール
 
 ```sh
 composer require ah-monica/monica
@@ -14,134 +24,59 @@ composer require ah-monica/monica
     'environment' => getenv('MONICA_ENVIRONMENT') ?: 'production',
     'release' => getenv('MONICA_RELEASE') ?: null,
     'transport' => 'shutdown',
-    'request_timeout_ms' => 2000,
-    'before_send' => static function (array $event): array {
-        // アプリケーション側で送信を許可した値だけにしてください。
-        unset($event['user']);
-        if (isset($event['request'])) {
-            unset($event['request']['headers']);
-        }
-        return $event;
-    },
 ]);
+```
 
+DSN は `https://msk_xxxxx@<host>/` の形式で、送信先は DSN の host（port を書いた場合は
+port も）に `/v1/envelope` を付けた URL です。DSN の path は使いません。`https` が必須
+です（`localhost` / `127.0.0.1` に限り `http` も使えます）。
+
+`init()` は例外 handler・error handler・shutdown function を登録します。既存の
+handler がある場合は、SDK の処理後にその handler へ chain します。登録したくない
+場合は `'auto_capture' => false` を渡してください。
+
+## 使い方
+
+### 例外・メッセージを送る
+
+```php
 \Monica\Monica::captureException($exception, [
     'tags' => ['service' => 'api'],
 ]);
+
+\Monica\Monica::captureMessage('cache rebuild skipped', 'warning');
 ```
 
-`init()` は未捕捉例外、warning / notice、shutdown時のfatal error・OOM・
-実行時間超過を収集します。既存のexception/error handlerがある場合は処理後にchainします。
-SDKはrequest body、Cookie、Authorization、SQL引数を自動収集しません。
+第 2 引数（`captureMessage` は第 3 引数）の context で event に載せられるキーは
+`tags` / `contexts` / `request` / `user` / `fingerprint` / `breadcrumbs` です。
+`captureException` は `level` も受け付けます（既定は `error`）。戻り値は `event_id`
+で、送らなかった場合（sampling で外れた、`before_send` が `null` を返した）は `null`
+です。
 
-## Transport
-
-- `shutdown`: FPMではレスポンス完了後に送信します。既定のcURL transportは接続と全体を
-  `request_timeout_ms`（既定2000ms）で打ち切ります。
-- `spool`: `spool_dir`へ権限0600のJSONをatomicに保存します。CLI/batch向けです。
-  flush中にprocessが停止して残ったclaimは、既定5分のlease満了後に次のflushが回収します。
-
-Apache + mod_php（`apache2handler`）では`shutdown`の送信がレスポンスをブロックします。
-レスポンスを返し切ってから送るために使う`fastcgi_finish_request()`がFPM / FastCGI
-SAPIにしか無く、mod_phpにはコネクションを切り離す手段がないためです。MONICAが
-応答しないとクライアントの待ち時間が`request_timeout_ms`（既定2000ms）の分だけ
-伸びるので、**この構成では`spool`を使ってください**。CLI/batchと同じ理由です。
-
-MONICA が恒久的に拒否した envelope（`400` / `422`）は spool に残さず、
-`.rejected` を付けて脇に退けます。残すと後続の envelope が、決して成功しない
-requestを待って出られなくなるためです。`429` / `5xx` とネットワーク障害はspoolに
-残り、待ち時間が過ぎてから送り直します（[再送](#再送retry)）。`401`はその1通を
-退けてflushを打ち切ります。`413` は transport が envelope を割って送り直します
-（[envelopeの分割](#envelopeの分割)）。`spool:flush` の出力の `rejected` が
-退けた数で、0 でなければ exit code は 1 です。
-
-**`401` を受けた transport は、以後 ingest へ POST しません**
-（`Client::isStopped()` / transport の `isStopped()` で分かります）。以後の送信は
-requestを投げずに `401` を返すだけになります。有効範囲はそのprocess
-（HTTP request 1本、CLIなら1回の実行）で、次のrequestは新しいClientとtransportに
-なるので、キーを直せば復帰します。`spool:flush` は `401` を受けた1通を `.rejected` へ
-退けてそのrunを打ち切り、残りは次のrunで送り直します。
-
-停止後に返る `401` は body を持ちません（`status()` は `401`、`errorCode()` /
-`errorMessage()` は `null`、`issues()` は空）。
-
-## 拒否の警告
-
-`422`（envelope schema 不正）は拒否レスポンスの body（`error.json`）を読み、
-**既定で `error_log()` へ1行の警告を出します**。拒否されたフィールドは
-`error.issues[].path` に出ます。`401` も1行出します（停止したあとの envelope に
-ついては出しません）。
-
-```text
-monica: ingest rejected the envelope with 422 (invalid_envelope): 1 issue(s); $.items[0].request.method: Invalid type: Expected string
-monica: ingest rejected the envelope with 401 (invalid_key); no further envelopes will be sent
-```
-
-`error.code` が body から読めないときは `unknown` です。ログに出るのはMONICAが
-返した内容だけで、envelopeやAPIキーは含みません。
-
-出力先は `on_diagnostic` で差し替えられます。`callable` を渡すと
-`(string $message, \Monica\Transport\Response $response)` を受け取り、
-`false` / `null` で無効になります。`bin/monica` は STDERR に出します。
-
-プログラムから読む場合は `Client::lastResponse()`（`spool:flush` 経路は
-`SpoolFlusher::lastResponse()`）が `status()` / `errorCode()` / `errorMessage()` /
-`issues()` を持つ `Response` を返します。
+queue に溜まった event は shutdown 時に自動で送られます（`auto_capture` を `false` に
+した場合は送られないので、自分で `flush()` を呼びます）。その前に送りたい場合も
+`flush()` を呼びます。
 
 ```php
-if (!\Monica\Monica::flush()) {
-    $response = \Monica\Monica::lastResponse();
-    foreach ($response !== null ? $response->issues() : [] as $issue) {
-        // $issue['path'] / $issue['message']
-    }
-}
+\Monica\Monica::flush(); // bool。送れなかった event は queue に残ります
 ```
 
-body が空・非JSON・`error.json` に適合しない・64 KiBを超える場合は、例外を投げずに
-issues無しの拒否として扱います。`400` などの他の4xxは警告を出しません（`429` は
-body を読みません）。
+### transport の選び方
 
-## envelopeの分割
+| `transport` | 動作 | 用途 |
+| --- | --- | --- |
+| `shutdown`（既定） | request の処理後に ingest へ直接 POST します。FPM / FastCGI では `fastcgi_finish_request()` でレスポンスを返し切ってから送ります | FPM / FastCGI |
+| `spool` | envelope を `spool_dir` に権限 0600 の JSON として atomic に書き出します。送信は `monica spool:flush` が行います | CLI / batch、mod_php、`429` / `5xx` の間も event を落としたくない場合 |
 
-envelope 1 通の上限は gzip 後 1 MiB・展開後 8 MiB です（`ingest.md`）。item 数 100 で
-の分割（`batch_size`）とは別に、transport が送信前に gzip 後の byte 数を測り、
-**上限を超える envelope を item 境界で半分に割って**、収まるまで繰り返します。
-1 通が複数 requestになります。MONICA が `413` を返した場合も割って送り直します。
+### spool の運用
 
-**item 1 件だけで上限を超える場合はその item を捨てます。** 捨てたことは警告に出し、
-次の envelope の `discarded` で MONICA にも伝えます。
-
-```text
-monica: dropped 1 item(s) that cannot fit one envelope (1234567 gzip bytes, limit 1048576, measured by the SDK); the event(s) are lost
-```
-
-byte 上限は `Monica\Transport\EnvelopeSplitter::MAX_GZIP_BYTES` /
-`MAX_DECOMPRESSED_BYTES` の定数です。
-
-## 再送（retry）
-
-再送するのは `429` / `5xx` とネットワーク障害だけで、他の 4xx は恒久的な失敗です。
-
-- `429` は `Retry-After` の秒数だけ待ちます。整数秒だけを解釈し（HTTP-date は
-  backoffに落とします）、上限は60秒で、超える値は丸めます
-- それ以外は `min(1000 * 2^(attempt-1), 30000)` ms に 50〜100% の jitter です
-- attempt が上限（既定5回、`SpoolFlusher` の第4引数 `RetryPolicy` で変更可）に
-  達したら envelope を捨て、警告を出します
-
-```text
-monica: giving up on a spooled envelope after 5 attempt(s); 3 event(s) are lost
-```
-
-待ち時間は `sleep()` で消費せず、attempt 回数と「この時刻まで送らない」を spool の
-ファイル名（`…--try2-at1757500000.json`）に持ちます。待ち時間中の envelope は
-`spool:flush` の出力の `deferred` に出ます。`sent=0 failed=0 deferred=3` は「MONICA が
-応答しない」ではなく「まだ時刻ではない」という意味で、exit code は 0 です。
-
-**待ち時間は次の flush が拾うので、`spool:flush` は定期実行してください。**
-1回しか実行しない運用だと、待ち時間に入った envelope はそのrunでは送られません。
-間隔は 1 分程度が扱いやすいです。同時に複数走っても問題ありません。
+`spool` を使う場合は、`vendor/bin/monica spool:flush` を定期実行してください。再送
+待ちの envelope は次の flush が拾うので、1 回しか実行しない運用では待ち時間に入った
+envelope が送られません。間隔は 1 分程度が扱いやすく、同時に複数走っても問題あり
+ません。
 
 ```cron
+MONICA_DSN=https://msk_xxxxx@<host>/
 * * * * * /usr/bin/php /srv/app/vendor/bin/monica spool:flush >> /var/log/monica-spool.log 2>&1
 ```
 
@@ -161,38 +96,155 @@ OnUnitActiveSec=1min
 AccuracySec=1s
 ```
 
-警告（`422` の issues、`401`、諦めた envelope）は STDERR に出るので、上の例のように
+出力は 5 つの counter です。
+
+```text
+MONICA spool: sent=0 failed=0 rejected=0 invalid=0 deferred=3
+```
+
+| counter | 意味 |
+| --- | --- |
+| `sent` | 送れた envelope |
+| `failed` | 送れずに spool へ戻した envelope（次の flush で送り直します） |
+| `rejected` | 送れないと判断して `.rejected` へ退けた envelope |
+| `invalid` | JSON として読めず `.invalid` へ退けたファイル |
+| `deferred` | 再送の待ち時間がまだ明けていない envelope（触っていません） |
+
+`failed` / `rejected` / `invalid` のいずれかが 0 でなければ exit code は 1 です。
+`deferred` だけが立っている場合は 0 です。警告は STDERR に出るので、上の例のように
 ログへ落としてください。
 
-**直接送信（`shutdown`）は再送しません。** `flush()` が false を返した event は queue に
-残り、同じ process の中で次に `flush()` が呼ばれたときに送り直すだけで、process が
-終われば失われます。**`429` / `5xx` の間の event を落としたくない場合は `spool` を
-使ってください。**
-
-DSNのAPIキーは secret key（`msk_`）です。public key（`mpk_`）は`X-Monica-Key`で
-送るbrowser / mobile向けなので、渡すと初期化の時点で弾きます。Bearerとして送っても
-`401`になり、eventが黙って消えるだけだからです。
+### CLI
 
 ```sh
 vendor/bin/monica test
 vendor/bin/monica spool:flush --spool-dir=/var/spool/monica
 ```
 
-`MONICA_DSN`、`MONICA_ENVIRONMENT`、`MONICA_RELEASE`、
-`MONICA_SPOOL_DIR`をCLIから利用できます。
+`test` は疎通確認の event を 1 件送ります。option は `test` が `--dsn`、
+`--environment`、`--release`、`--timeout-ms`（既定 2000）、`spool:flush` が `--dsn`、
+`--spool-dir`、`--timeout-ms` で、それぞれ `MONICA_DSN`、`MONICA_ENVIRONMENT`、
+`MONICA_RELEASE`、`MONICA_SPOOL_DIR` からも読みます。どちらも DSN が必要で、無い場合は
+exit code 2 です。
 
-PSR-18 clientを使う場合は、`http_client`、`request_factory`、
-`stream_factory`をまとめて渡します。PSR-18自体にtimeout設定の標準がないため、
-注入するclientも2秒程度に設定してください。
+### PSR-18 client を使う
 
-## Privacy
+`http_client`、`request_factory`、`stream_factory` を 3 つまとめて渡すと、cURL の
+代わりにその client で送ります。PSR-18 自体に timeout 設定の標準がないため、注入する
+client 側で 2 秒程度に設定してください。
 
-`before_send`は送信直前のevent配列を受け取り、加工後の配列または破棄する場合は
-`null`を返します。個人情報を扱うサービスではblacklistではなく、MONICAへ送ってよい
-キーだけでeventを組み直すallowlist方式を推奨します。transportとhook内の例外は
-アプリケーションへ投げ返さず、MONICA自身の失敗を再収集しません。
+```php
+\Monica\Monica::init([
+    'dsn' => getenv('MONICA_DSN'),
+    'environment' => 'production',
+    'http_client' => $psr18Client,
+    'request_factory' => $psr17Factory,
+    'stream_factory' => $psr17Factory,
+]);
+```
 
-## 開発
+## オプション
+
+`Monica::init()` / `new \Monica\Client()` に渡す配列のキーです。
+
+| option | 型 | default | 説明 |
+| --- | --- | --- | --- |
+| `dsn` | string | （必須） | 空文字は不可。`mpk_` で始まる key は拒否します |
+| `environment` | string | （必須） | 空文字は不可 |
+| `release` | string\|null | `null` | event の `release` |
+| `transport` | `'shutdown'` \| `'spool'` | `'shutdown'` | それ以外の値は例外 |
+| `auto_capture` | bool | `true` | `false` で handler を登録しません |
+| `error_types` | int | `E_WARNING｜E_USER_WARNING｜E_NOTICE｜E_USER_NOTICE` | 収集する PHP error の bitmask。fatal error は別途 shutdown で拾います |
+| `sample_rate` | float | `1.0` | 0〜1。範囲外は例外 |
+| `before_send` | callable\|null | `null` | queue に入れる前の event 配列を受け取り、加工した配列か `null`（破棄）を返す |
+| `on_diagnostic` | callable\|false\|null | `error_log()` へ 1 行 | 警告の出力先。`false` / `null` で無効 |
+| `max_queue_size` | int | `100` | 超えた分は古い event から捨て、`discarded` として MONICA に伝えます |
+| `batch_size` | int | `100` | envelope 1 通あたりの item 数。実効値は `min(指定値, 100, max_queue_size)` |
+| `request_timeout_ms` | int | `2000` | 接続と全体の両方に適用します |
+| `spool_dir` | string | `sys_get_temp_dir()/monica-spool` | `transport` が `spool` のとき使います |
+| `spool_max_files` | int | `1000` | 超えると古いファイルから削除します |
+| `memory_reserve_bytes` | int | `262144` | OOM 後の shutdown 処理用に確保しておく領域 |
+| `project_root` | string\|null | `null` | stack frame の `in_app` 判定の基準 |
+| `server_name` | string\|null | `gethostname()` の値 | event の `server_name` |
+| `http_client` / `request_factory` / `stream_factory` | PSR-18 / PSR-17 | `null` | 3 つまとめて渡します。1 つでも欠けると例外 |
+| `transport_instance` | `Monica\Transport\TransportInterface` | `null` | transport を差し替えます（`transport` が `spool` のときは使いません） |
+
+正の整数を取る option（`max_queue_size`、`batch_size`、`request_timeout_ms`、
+`spool_max_files`、`memory_reserve_bytes`）に 1 未満を渡すと例外になります。
+
+## 自動で収集するもの
+
+`init()` が自動で拾うのは次の 3 つです。
+
+- 未捕捉例外（`level` は `fatal`、`mechanism.handled` は `false`）
+- `error_types` に該当する PHP error（既定は warning / notice）
+- shutdown 時の fatal error・OOM・実行時間超過
+
+event に自動で入るのは、`event_id`、`timestamp`、`level`、`platform`（`php`）、
+`environment`、`release`（設定したときだけ）、`server_name`（`server_name` option が
+無ければ `gethostname()`。取れなければ key 自体が入りません）、例外の class 名・
+message・stack frame（ファイル名・関数名・行番号・`in_app`）です。連鎖した例外は
+10 段、stack frame は 200 段までです。
+
+request body、Cookie、Authorization ヘッダ、SQL 引数、`$_SERVER` は読みません。
+`request` / `user` などのキーは、アプリケーションが context で渡したものだけが
+入ります。
+
+### Privacy
+
+`before_send` は queue に入れる前の event 配列を受け取り、加工後の配列か、破棄する
+場合は `null` を返します。個人情報を扱うサービスでは、blacklist ではなく MONICA へ
+送ってよいキーだけで event を組み直す allowlist 方式を推奨します。
+
+```php
+'before_send' => static function (array $event): array {
+    unset($event['user']);
+    if (isset($event['request'])) {
+        unset($event['request']['headers']);
+    }
+
+    return $event;
+},
+```
+
+transport と hook 内で起きた例外はアプリケーションへ投げ返さず、MONICA 自身の失敗を
+再収集することもありません。
+
+## 送信結果と診断
+
+ingest が envelope を拒否した場合、`422`（schema 不正）と `401`（key 拒否）は既定で
+`error_log()` に 1 行の警告を出します（`bin/monica` は STDERR）。出力先は
+`on_diagnostic` で差し替え・無効化できます。
+
+プログラムから読む場合は `Monica::lastResponse()` / `Client::lastResponse()`（spool は
+`SpoolFlusher::lastResponse()`）が `status()` / `errorCode()` / `errorMessage()` /
+`issues()` を持つ `Monica\Transport\Response` を返します。`401` を受けたあとは
+`Client::isStopped()` が `true` になります。
+
+警告の読み方、status ごとの挙動、再送と queue の詳細は
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) を参照してください。
+
+## 制約
+
+- DSN の API キーは secret key（`msk_`）です。public key（`mpk_`）を渡すと初期化の
+  時点で例外になります
+- Apache + mod_php（`apache2handler`）では `shutdown` の送信がレスポンスをブロック
+  します。この構成では `spool` を使ってください
+- `shutdown`（直接送信）は再送しません。`flush()` が失敗した event は同じ process の
+  中でしか送り直されず、process が終われば失われます。`429` / `5xx` の間の event を
+  落としたくない場合は `spool` を使ってください
+- envelope 1 通の上限は gzip 後 1 MiB・展開後 8 MiB です。超える envelope は item
+  境界で分割して送りますが、item 1 件だけで超える場合はその item を捨てます
+- queue は `max_queue_size` 件までで、溢れた分は古い event から捨てます。spool は
+  `spool_max_files` 件までです
+
+## ライセンス
+
+Apache-2.0
+
+## 開発者向け
+
+### ビルドとテスト
 
 ```sh
 composer install
@@ -205,18 +257,11 @@ composer test
 - `tests/fatal-runner.php`: 子プロセスの fatal shutdown で spool に 1 件残ること
 - `tests/spec-contract.php`: 送信する envelope が MONICA の公開契約を満たすこと
 
-## 公開契約
+### 公開契約（spec/）
 
-protocol は言語に依存しない契約なので、この repository は持ちません。MONICA が
-<https://spec.monica.accelhack.net/v1/> に配信しているものを取り込んだコピーが
-`spec/` にあります。
-
-```text
-spec.lock.json   取り込んだ内容の記録（version、revision、全ファイルの sha256）
-spec/v1/         取り込んだコピー（配布物には入りません）
-```
-
-取り込みは script でやります。手で `spec/` を編集しても、次の取り込みで消えます。
+`spec/` は <https://spec.monica.accelhack.net/v1/> から取り込んだコピーで、
+`spec.lock.json` が取り込んだ内容（version、revision、全ファイルの sha256）を持ちます。
+どちらも配布物には入りません。手で `spec/` を編集しても次の取り込みで消えます。
 
 ```sh
 composer spec:sync           # 配信元から取り込み直す
@@ -224,46 +269,11 @@ composer spec:check          # 取り込んだコピーが spec.lock.json と一
 composer spec:check-remote   # さらに配信元が動いていないか
 ```
 
-起点は配信元の `index.json` です。他の全ファイルのパスと sha256、バンドル全体の
-`revision` がそこに並んでいるので、**何を取り込むかは配信元が決めます**。この
-repository は取り込む対象の一覧を持ちません。結果として
+### リリース
 
-- ファイルの列挙、取得したものの整合性検査、上流にファイルが増えたことの検知が
-  索引 1 本で済みます
-- `spec:check-remote` は `revision` を 1 個比べるだけで、動いていたときに何が
-  追加・変更・削除されたかを索引から出します
+1. `src/Client.php` の `Client::SDK_VERSION` を上げる
+2. `v<semver>` の tag を打つ（Packagist が push webhook で version を拾います）
 
-`revision` はバンドル全体の指紋（各ファイルの `"<sha256>  <path>"` を path の
-byte 順に改行で繋いだ文字列の sha256）で、版番号ではないので新旧や大小は読めません。
-`spec:check` はこれを `spec.lock.json` の `files` から再計算するので、`spec/` を
-書き換えて lock の digest を揃えただけの改竄も落ちます。
-
-契約テストは spec が見つからないと skip せず失敗します。契約が変わったときに
-PHP だけ気付けない状態を作らないためです。schema を通ることは受理されることと
-同じではない（`payload.md` が prose で定めている義務がある）ので、
-`tests/spec-contract.php` は次の 4 層を見ます。
-
-1. `envelope.json` と `limits.json` が、この SDK の前提どおりであること
-2. MONICA の test vector が、bundle の言うとおりの判定になること
-3. この SDK が出す envelope が、schema と `payload.md` の義務を満たすこと
-4. この SDK が投げる request が、`transport.json` の値と一致すること
-
-4 は `ingest.md` の散文から定数を写すのではなく、`transport.json` を読んで
-突き合わせます。だから MONICA 側が endpoint やヘッダを変えると、ここが落ちます。
-
-### transport.json の実装状況
-
-`endpoint` / `dsn` / `auth` / `status` / `retry` の全 section を実装しています。
-
-意図的な乖離が1つあります。**直接送信（`shutdown`）は再送しません。**
-`429` / `5xx` を落としたくない場合は `spool` を使ってください。
-
-契約テストは `transport.json` の section 名、status の語彙、status ごとの分類、
-`retry` の定数（`Retry-After` の上限、backoff の base / factor / max / jitter）を
-固定しています。
-
-## Release
-
-tag を打つだけです。Packagist が push webhook で version を拾います。配布物には
-`src/`、`bin/`、`composer.json`、`README.md`、`LICENSE` だけが入ります
-（`.gitattributes` の `export-ignore`。CI の「配布物」job が実際の tarball で確認します）。
+配布物には `src/`、`bin/`、`composer.json`、`README.md`、`LICENSE` などが入ります
+（`.gitattributes` の `export-ignore`）。CI がタグと `SDK_VERSION` の一致、および
+配布物の中身を検査します。
