@@ -7,8 +7,12 @@ name: ci
 #   - package: Packagist が配る tarball の中身と、それだけで autoload できること
 #   - release: タグと SDK_VERSION が一致すること（タグを打ったときだけ）
 #
-# PHP の版は 7.4 / 8.0 / 8.3。下限が対応保証の下限で、7.4 は composer.json の
-# require、8.0 は導入先の実行環境、8.3 は現行安定版。
+# PHP の版は 7.4 / 8.0 / 8.3 / 8.5。7.4 は composer.json の require が定める
+# 対応保証の下限、8.0 と 8.3 は導入先の実行環境、8.5 が現行安定版。
+#
+# 上端を追うのは、この SDK が host の error handler に割り込むから。SDK 自身が
+# deprecation を出すと、それが host の handler に流れる。curl_close (8.5) と
+# E_STRICT (8.4) がまさにそれで、上端を回していないと気付けなかった。
 
 on:
   pull_request:
@@ -41,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ["7.4", "8.0", "8.3"]
+        php: ["7.4", "8.0", "8.3", "8.5"]
     steps:
       - uses: actions/checkout@v6
 
@@ -64,12 +68,27 @@ jobs:
 
       - name: Composer packageを検証
         run: |
+          set -o pipefail
           composer validate --strict
           composer install --no-interaction --prefer-dist
-          composer test
+          composer test 2>&1 | tee /tmp/test-output.txt
+
+      - name: src/がdeprecationを出していないか
+        # この SDK は host の error handler に割り込む。src/ が deprecation を
+        # 出せば、それは導入先の handler と log にそのまま出る。test が緑でも
+        # 検出されないので、出力そのものを見る。
+        #
+        # 見るのは src/ の行だけ。配布されるのは src/ で、tests/ と vendor/ の
+        # deprecation は導入先に届かない。
+        run: |
+          if grep -F 'Deprecated:' /tmp/test-output.txt | grep -F '/src/'; then
+            echo "::error::src/ が deprecation を出しています。上の行が出処です。導入先の error handler にそのまま流れるので、PHP ${{ matrix.php }} で出ない書き方に直してください。"
+            exit 1
+          fi
+          echo "no deprecation from src/"
 
   spec:
-    # 配信元を叩くので matrix から外してある。network の失敗で PHP 3 版の
+    # 配信元を叩くので matrix から外してある。network の失敗で PHP 4 版の
     # job が道連れになると、落ちた理由が読めなくなる。
     #
     # この job だけが repository の外の状態を見る。他の job は commit の性質を
